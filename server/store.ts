@@ -117,12 +117,40 @@ function stableStringify(obj: Record<string, number>): string {
   return JSON.stringify(obj, keys);
 }
 
+function tableExists(db: DatabaseSync, name: string): boolean {
+  return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
+}
+
+/**
+ * `CREATE TABLE IF NOT EXISTS` leaves an older table exactly as it found it, so a database
+ * written before a column existed would fail on the first prepared statement. Rebuilding beats
+ * reconciling in place: the events upsert is insert-or-ignore, so widening the table with
+ * ALTER TABLE would keep every existing row and leave its new columns null through every later
+ * backfill, which reads as a working dashboard showing zeroes. Dropping the offsets alongside
+ * is what makes the next sweep re-read the full window. The transcripts are the source of
+ * truth and data/usage.db is disposable.
+ */
+function rebuildIfStale(db: DatabaseSync): void {
+  const columns = (db.prepare('PRAGMA table_info(events)').all() as Array<{ name: string }>)
+    .map((column) => column.name);
+  if (columns.length === 0) return;
+
+  const stale: string[] = EVENT_COLUMNS.filter((column) => !columns.includes(column));
+  if (!tableExists(db, 'tool_calls')) stale.push('tool_calls');
+  if (stale.length === 0) return;
+
+  console.log(`[store] schema predates ${stale.join(', ')}; rebuilding from the transcripts`);
+  for (const table of ['events', 'tool_calls', 'offsets']) db.exec(`DROP TABLE IF EXISTS ${table}`);
+}
+
 export function openStore(dbPath: string): Store {
   mkdirSync(dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
 
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA busy_timeout = 5000');
+
+  rebuildIfStale(db);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS events (
