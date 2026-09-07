@@ -15,10 +15,19 @@ of transcript history, then updates live as new requests land, with no page refr
 | Subagent traffic is ~40% of requests, tagged `isSidechain` + `attributionAgent` | measured |
 | Recursive `fs.watch` on the projects dir fires on transcript appends | 12s probe caught 2 live sessions |
 | `node:sqlite` and native TypeScript both work in Node 26.8.1 | probed |
+| `attributionSkill` on assistant lines names the skill loaded in context | 6,812 of 19,190 requests (35.5%), 32 distinct skills |
+| Skill attribution is consistent across a request's duplicate lines | all 6,813 skill-attributed requestIds carry exactly 1 distinct value |
+| `attributionPlugin` is **not** derivable from the skill name prefix | pstack: 9,584 lines vs 7,594 from pstack skills |
+| `message.content` is always a list of length 1 | 38,363 of 38,363 assistant lines |
+| A request issues 1 to 13 `tool_use` blocks | 21,359 distinct ids over 19,190 requests |
+| `attributionMcpServer` / `attributionMcpTool` disagree with the block on their own line | 203 claude-in-chrome calls with a null server; tool field names a different tool 60+ times per pair |
 
 Consequences: **dedupe by `requestId` or every metric doubles.** `thinking` is a subset of
 `output`, so never add it into a token total. Cache reads dominate volume by ~40x, so any
-chart that stacks them raw will flatten everything else.
+chart that stacks them raw will flatten everything else. Bash dominates tool calls by ~9x for
+the same reason. **MCP server and tool come from splitting the `mcp__<server>__<tool>` name,
+never from the `attributionMcp*` fields**, which read as lagging context markers rather than a
+record of the call.
 
 ## Architecture
 
@@ -54,7 +63,7 @@ in someone else's file, report it instead.
 
 | # | File | Job |
 | --- | --- | --- |
-| B1 | `server/parse.ts` | One transcript line → `UsageEvent \| SessionCost \| null` |
+| B1 | `server/parse.ts` | One transcript line → `UsageEvent` + its `ToolCall`s, `SessionCost`, or nothing |
 | B2 | `server/pricing.ts` | Per-model token pricing, `costOf(event)` |
 | B3 | `server/store.ts` | SQLite schema, idempotent upsert, snapshot reads, tail offsets |
 | B4 | `server/tail.ts` | Byte-offset incremental file reads, partial trailing lines |
@@ -69,6 +78,7 @@ in someone else's file, report it instead.
 | F7 | `web/src/panels/cache.tsx` | Cache efficiency, 5m vs 1h, savings |
 | F8 | `web/src/panels/sessions.tsx` | Session table + drill-down, live feed |
 | F9 | `web/src/App.tsx` + global filter bar | Layout, filters, routing between panels |
+| F10 | `web/src/panels/Skills.tsx` | Skill / plugin / tool / MCP-server breakdowns |
 
 ## Features
 
@@ -91,12 +101,23 @@ model mix. Drill into one session's request timeline. A live feed of recent requ
 
 **Rhythm.** A day-by-hour heatmap of token volume, and thinking tokens as a share of output.
 
-**Filters.** Date range, project, model, and main-versus-subagent, applied globally to
-every panel. All client-side, so they are instant.
+**Skills and tools.** What each skill costs, ranked by cost with its main-thread versus
+subagent split, because a skill that fans out subagents is where the money actually goes.
+The same ranking by plugin. Tool calls ranked by count, and MCP servers ranked separately
+since that is the actionable slice of a 101-name tail.
+
+A tool call has no cost of its own. Cost columns on the tool tables are the cost of the
+**requests** that called the tool, so one request that calls three tools lands in three rows
+and the shares sum above 100%. Every such column says so; nothing divides a request's cost
+across its tool calls, because there is no basis for the split.
+
+**Filters.** Date range, project, model, skill, and main-versus-subagent, applied globally to
+every panel. All client-side, so they are instant. Filtering reaches the tool grain through
+the `requestId` join: a tool call counts only when its request survives the filters.
 
 ## Correctness bar
 
-`scripts/validate.ts` must pass. It is the lever that proves the pipeline. Five checks, each
+`scripts/validate.ts` must pass. It is the lever that proves the pipeline. Seven checks, each
 testing one thing:
 
 1. **DEDUPE.** Store count matches an independent recount of distinct `requestId`s, written
@@ -114,6 +135,11 @@ testing one thing:
    running Claude Code while the validator runs.
 5. **INVARIANTS.** No event has `thinking > output`, no negative fields, no duplicate
    `requestId`, every `ts` inside the window.
+6. **TOOLCALLS.** Store count matches an independent recount of distinct `tool_use` ids, again
+   written against the raw format so it can catch a parser bug instead of restating it. Every
+   stored tool call's `requestId` resolves to an event, because the client join depends on it.
+7. **ATTRIBUTION.** No `requestId` in the window carries two distinct `attributionSkill`
+   values. The whole per-skill cost number rests on that, so it is asserted rather than assumed.
 
 ## What the measurements turned up
 
@@ -128,6 +154,14 @@ oldest-first, which is deterministic and hands requests to the session that made
 **A `cost-state` record covers one incarnation, not the whole file.** Its `startTime` can post-
 date the transcript's earliest request by hours. Summing a whole transcript against it
 overstated one session by 8x. Per-session cost comparisons scope to `ts >= startTime`.
+
+**The MCP attribution fields do not record the call.** `attributionMcpServer` and
+`attributionMcpTool` look like the obvious source for per-MCP-tool stats, and they are wrong for
+it. On 203 lines a `claude-in-chrome` tool is called with a null server, and the tool field names
+a different tool than the block on the same line more than 60 times per pair, `computer` against
+`navigate` being the commonest. They behave like markers for the newest MCP result in context,
+not a record of what the line invoked. Splitting the `mcp__<server>__<tool>` name is exact, so
+that is what `mcpTarget()` does, and the fields are ingested nowhere.
 
 **Cost is a lower bound, by about 7%.** The transcripts hold 98% of billed cache reads but only
 60% of billed output tokens and 3% of billed fresh input, because Claude Code bills internal

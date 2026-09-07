@@ -33,6 +33,18 @@ export type UsageEvent = {
   isSidechain: boolean;
   /** Subagent type for sidechain events, e.g. "Explore". */
   attributionAgent: string | null;
+  /**
+   * Skill loaded in context when the request was made, e.g. "pstack:poteto-mode".
+   * Marks every request the skill was live for, sidechains included, so grouping on it
+   * gives what a skill actually costs. Consistent across a request's duplicate lines:
+   * all 6,813 skill-attributed requests in a 30-day window carry exactly one value.
+   */
+  attributionSkill: string | null;
+  /**
+   * Plugin the skill or agent came from, e.g. "pstack". Not derivable from
+   * `attributionSkill`, because plugin agents produce requests with no skill attached.
+   */
+  attributionPlugin: string | null;
   input: number;
   output: number;
   /** Subset of `output`, already counted in it. Never add to a token total. */
@@ -47,6 +59,44 @@ export type UsageEvent = {
   /** Claude Code version that made the request. */
   version: string | null;
 };
+
+/**
+ * One tool invocation, at the content-block grain rather than the request grain.
+ *
+ * A request issues 1 to 13 of these. Claude Code writes one content block per transcript
+ * line, so a request's tool calls are spread across its duplicate lines and cannot live on
+ * `UsageEvent` without a merge-on-conflict upsert. `id` is the dedupe key and the store's
+ * primary key; ~1% of ids repeat under session resume, exactly as `requestId` does.
+ *
+ * Attribution is deliberately absent. The browser already holds every `UsageEvent` keyed by
+ * `requestId`, so project, model, skill, agent and cost come from joining to the request.
+ * One source of truth, and nothing to keep in sync.
+ */
+export type ToolCall = {
+  /** The `toolu_…` block id. */
+  id: string;
+  requestId: string;
+  ts: number;
+  /** Wire name, e.g. "Bash" or "mcp__Sanity__query_documents". */
+  name: string;
+};
+
+/**
+ * Server and tool for an MCP call, or null for a built-in tool.
+ *
+ * Derived from `ToolCall.name`, never from the transcript's `attributionMcpServer` and
+ * `attributionMcpTool` fields. Those disagree with the block on their own line (203 lines
+ * call a claude-in-chrome tool with a null server; the tool field names a different tool
+ * than the block on 60+ lines per pair), so they read as lagging context markers rather
+ * than a record of the call.
+ */
+export function mcpTarget(name: string): { server: string; tool: string } | null {
+  if (!name.startsWith('mcp__')) return null;
+  const rest = name.slice(5);
+  const split = rest.indexOf('__');
+  if (split <= 0) return null;
+  return { server: rest.slice(0, split), tool: rest.slice(split + 2) };
+}
 
 /** Claude Code's own per-session cost accounting, used to validate `cost`. */
 export type SessionCost = {
@@ -70,6 +120,8 @@ export type Snapshot = {
   /** Ordered oldest-first. */
   events: UsageEvent[];
   sessionCosts: SessionCost[];
+  /** Ordered oldest-first, and only for requests inside `events`. */
+  toolCalls: ToolCall[];
   /** True while the initial 30-day backfill is still running. */
   backfilling: boolean;
 };
@@ -80,6 +132,7 @@ export type Delta = {
   serverNow: number;
   events: UsageEvent[];
   sessionCosts: SessionCost[];
+  toolCalls: ToolCall[];
 };
 
 /** Keeps the connection warm and the freshness clock accurate when idle. */

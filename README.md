@@ -30,6 +30,25 @@ store makes `requestId` a primary key rather than deduping in application code.
 
 `thinking` tokens are a subset of `output` tokens and are never added into a token total.
 
+## What a skill costs
+
+Claude Code stamps each request with the skill loaded in its context, so the dashboard can
+rank skills by what they actually cost. About 35% of requests carry a skill. The ranking
+shows the main-thread and subagent split for each one, which matters because a skill that
+fans out subagents spends most of its money there rather than in the turn that invoked it.
+
+Tool calls are counted at a finer grain than requests: one request issues between one and
+thirteen of them, so they are stored separately and keyed by the tool-use block id. A tool
+call has no cost of its own, and the dashboard does not invent one. The cost columns on the
+tool tables are the cost of the **requests** that called that tool, which means a request
+calling three tools contributes to three rows and the shares add up to more than 100%. The
+tables say so where they show it.
+
+MCP servers and tools are read off the `mcp__<server>__<tool>` name. The transcripts also
+carry `attributionMcpServer` and `attributionMcpTool` fields, which look like the obvious
+source and are not: they disagree with the tool actually invoked on their own line, so
+nothing here reads them. `SPEC.md` has the measurements.
+
 ## Cost is a lower bound
 
 Token counts here are essentially complete: the transcripts hold 98% of the cache reads and
@@ -51,11 +70,12 @@ more than 10% off Claude Code's own total.
 npm run validate
 ```
 
-`scripts/validate.ts` re-counts distinct requests with its own independent reader, compares
-derived cost against the `totalCostUSD` Claude Code records for each session, re-runs the
-backfill to prove ingest is idempotent, and asserts the per-event invariants. It exits
-non-zero on failure, so it is the thing to run after any change to the ingest path rather
-than trusting the dashboard to look plausible.
+`scripts/validate.ts` re-counts distinct requests and distinct tool calls with its own
+independent reader, compares derived cost against the `totalCostUSD` Claude Code records for
+each session, re-runs the backfill to prove ingest is idempotent, asserts the per-event
+invariants, and proves no request carries two different skill attributions, since the
+per-skill cost figures rest on that. It exits non-zero on failure, so it is the thing to run
+after any change to the ingest path rather than trusting the dashboard to look plausible.
 
 ## Layout
 
