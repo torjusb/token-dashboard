@@ -1,4 +1,5 @@
-import type { SessionCost, UsageEvent } from '../../../shared/types.ts';
+import { mcpTarget } from '../../../shared/types.ts';
+import type { SessionCost, ToolCall, UsageEvent } from '../../../shared/types.ts';
 import type { Filters } from './filters.tsx';
 
 export type Totals = {
@@ -119,6 +120,7 @@ export function totals(events: readonly UsageEvent[]): Totals {
 export function applyFilters(events: readonly UsageEvent[], filters: Filters): UsageEvent[] {
   const projects = filters.projects.length > 0 ? new Set(filters.projects) : null;
   const models = filters.models.length > 0 ? new Set(filters.models) : null;
+  const skills = filters.skills.length > 0 ? new Set(filters.skills) : null;
   const scope = filters.agentScope;
   const out: UsageEvent[] = [];
   for (const e of events) {
@@ -126,6 +128,8 @@ export function applyFilters(events: readonly UsageEvent[], filters: Filters): U
     if (filters.to !== null && e.ts > filters.to) continue;
     if (projects !== null && !projects.has(e.project)) continue;
     if (models !== null && !models.has(e.model)) continue;
+    const skill = e.attributionSkill;
+    if (skills !== null && (skill === null || !skills.has(skill))) continue;
     if (scope === 'main' && e.isSidechain) continue;
     if (scope === 'sub' && !e.isSidechain) continue;
     out.push(e);
@@ -287,6 +291,10 @@ export function heatmap(
 /** The collapsed tail row `groupBy` emits when `top` is smaller than the group count. */
 const OTHER = '__other__';
 
+/** Two thirds of requests carry no skill, so these rows are the baseline, not an anomaly. */
+export const NO_SKILL = 'no skill loaded';
+export const NO_PLUGIN = 'no plugin';
+
 export function groupBy<K>(
   events: readonly UsageEvent[],
   keyFn: (e: UsageEvent) => K | null,
@@ -343,6 +351,14 @@ export function byAgent(events: readonly UsageEvent[], opts?: { top?: number }) 
   );
 }
 
+export function bySkill(events: readonly UsageEvent[], opts?: { top?: number }) {
+  return groupBy(events, (e) => e.attributionSkill ?? NO_SKILL, opts);
+}
+
+export function byPlugin(events: readonly UsageEvent[], opts?: { top?: number }) {
+  return groupBy(events, (e) => e.attributionPlugin ?? NO_PLUGIN, opts);
+}
+
 export function byEffort(events: readonly UsageEvent[], opts?: { top?: number }) {
   return groupBy(events, (e) => e.effort, opts);
 }
@@ -353,6 +369,141 @@ export function byBranch(events: readonly UsageEvent[], opts?: { top?: number })
 
 export function byVersion(events: readonly UsageEvent[], opts?: { top?: number }) {
   return groupBy(events, (e) => e.version, opts);
+}
+
+/**
+ * A tool row. `calls` is the tool grain; the cost and token figures belong to the
+ * requests that made those calls, which is why they are named for the request.
+ *
+ * Those two are NOT additive down a column. A request that calls Bash, Read and Edit
+ * lands its full cost in all three rows, so the rows sum past the filtered total and
+ * the shares past 100%. Only `calls`, `share` and the group's own `requests` add up.
+ */
+export type ToolTotals = {
+  calls: number;
+  /** Distinct requests that made at least one of these calls. */
+  requests: number;
+  requestCost: number;
+  requestTokens: number;
+};
+
+/**
+ * Joins tool calls to the events they were made by, which is the only path filters have
+ * to the tool grain: a call whose request is not in `events` is dropped, so passing an
+ * already-filtered event list filters the tools too.
+ */
+function groupTools<K>(
+  toolCalls: readonly ToolCall[],
+  events: readonly UsageEvent[],
+  keyFn: (name: string) => K | null,
+  opts?: { top?: number },
+): Array<{ key: K | typeof OTHER; share: number } & ToolTotals> {
+  const index = new Map<string, UsageEvent>();
+  for (const e of events) index.set(e.requestId, e);
+
+  const groups = new Map<K, { calls: number; requests: Set<string> }>();
+  for (const call of toolCalls) {
+    if (!index.has(call.requestId)) continue;
+    const key = keyFn(call.name);
+    if (key === null) continue;
+    let g = groups.get(key);
+    if (g === undefined) {
+      g = { calls: 0, requests: new Set() };
+      groups.set(key, g);
+    }
+    g.calls += 1;
+    g.requests.add(call.requestId);
+  }
+
+  const ranked: Array<{ key: K | typeof OTHER; calls: number; requests: Set<string> }> = [];
+  for (const [key, g] of groups) ranked.push({ key, calls: g.calls, requests: g.requests });
+  ranked.sort((a, b) => b.calls - a.calls);
+
+  const top = opts?.top;
+  let rows = ranked;
+  if (top !== undefined && top > 0 && ranked.length > top) {
+    // The tail's request sets are unioned rather than summed, because one request can
+    // call two different tail tools and would otherwise be counted twice.
+    const requests = new Set<string>();
+    let calls = 0;
+    for (let i = top; i < ranked.length; i++) {
+      const tail = ranked[i];
+      if (tail === undefined) continue;
+      calls += tail.calls;
+      for (const requestId of tail.requests) requests.add(requestId);
+    }
+    rows = [...ranked.slice(0, top), { key: OTHER, calls, requests }];
+  }
+
+  let grand = 0;
+  for (const row of rows) grand += row.calls;
+  return rows.map((row) => {
+    let requestCost = 0;
+    let requestTokens = 0;
+    for (const requestId of row.requests) {
+      const e = index.get(requestId);
+      if (e === undefined) continue;
+      requestCost += e.cost;
+      requestTokens += tokensOf(e);
+    }
+    return {
+      key: row.key,
+      share: grand > 0 ? row.calls / grand : 0,
+      calls: row.calls,
+      requests: row.requests.size,
+      requestCost,
+      requestTokens,
+    };
+  });
+}
+
+export function byTool(
+  toolCalls: readonly ToolCall[],
+  events: readonly UsageEvent[],
+  opts?: { top?: number },
+) {
+  return groupTools(toolCalls, events, (name) => name, opts);
+}
+
+export function byMcpServer(
+  toolCalls: readonly ToolCall[],
+  events: readonly UsageEvent[],
+  opts?: { top?: number },
+) {
+  return groupTools(toolCalls, events, (name) => mcpTarget(name)?.server ?? null, opts);
+}
+
+/** The counts a tool panel needs for its headings, over the same join as `byTool`. */
+export function toolMix(
+  toolCalls: readonly ToolCall[],
+  events: readonly UsageEvent[],
+): { calls: number; requests: number; tools: number; mcpCalls: number; mcpServers: number } {
+  const known = new Set<string>();
+  for (const e of events) known.add(e.requestId);
+
+  const requests = new Set<string>();
+  const tools = new Set<string>();
+  const mcpServers = new Set<string>();
+  let calls = 0;
+  let mcpCalls = 0;
+  for (const call of toolCalls) {
+    if (!known.has(call.requestId)) continue;
+    calls += 1;
+    requests.add(call.requestId);
+    tools.add(call.name);
+    const target = mcpTarget(call.name);
+    if (target !== null) {
+      mcpCalls += 1;
+      mcpServers.add(target.server);
+    }
+  }
+  return {
+    calls,
+    requests: requests.size,
+    tools: tools.size,
+    mcpCalls,
+    mcpServers: mcpServers.size,
+  };
 }
 
 export type SessionRow = {
@@ -509,10 +660,14 @@ export function recentFeed(events: readonly UsageEvent[], n: number): UsageEvent
   return [...events].sort((a, b) => b.ts - a.ts).slice(0, n);
 }
 
-function keysByVolume(events: readonly UsageEvent[], pick: (e: UsageEvent) => string): string[] {
+function keysByVolume(
+  events: readonly UsageEvent[],
+  pick: (e: UsageEvent) => string | null,
+): string[] {
   const volume = new Map<string, number>();
   for (const e of events) {
     const key = pick(e);
+    if (key === null) continue;
     volume.set(key, (volume.get(key) ?? 0) + tokensOf(e));
   }
   return [...volume.entries()].sort((a, b) => b[1] - a[1]).map(([key]) => key);
@@ -524,4 +679,8 @@ export function distinctProjects(events: readonly UsageEvent[]): string[] {
 
 export function distinctModels(events: readonly UsageEvent[]): string[] {
   return keysByVolume(events, (e) => e.model);
+}
+
+export function distinctSkills(events: readonly UsageEvent[]): string[] {
+  return keysByVolume(events, (e) => e.attributionSkill);
 }
