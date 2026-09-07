@@ -117,6 +117,10 @@ function Meter({ fill, color, filled }: { fill: number; color: string; filled: b
   );
 }
 
+function plural(count: number, noun: string): string {
+  return `${formatCount(count)} ${noun}${count === 1 ? '' : 's'}`;
+}
+
 function tailLabel(count: number, top: number, noun: string): string {
   const rest = Math.max(count - top, 0);
   return `Other (${formatCount(rest)} ${noun}${rest === 1 ? '' : 's'})`;
@@ -327,7 +331,7 @@ export function Skills({ events, toolCalls, loading = false }: SkillsProps) {
       <div style={{ marginBottom: 'var(--sp-4)' }}>
         <h1>Skills and tools</h1>
         <div className="muted" style={{ fontSize: 12 }}>
-          {`${formatCount(ranked.requests)} of ${formatCount(events.length)} requests ran with a skill loaded, across ${formatCount(ranked.rows.length)} skills`}
+          {`${formatCount(ranked.requests)} of ${formatCount(events.length)} requests ran with a skill loaded, across ${plural(ranked.rows.length, 'skill')}`}
         </div>
       </div>
 
@@ -401,7 +405,9 @@ export function Skills({ events, toolCalls, loading = false }: SkillsProps) {
           )}
 
           <p className="muted" style={NOTE_STYLE}>
-            {`Share is of skill-attributed cost, not of everything. The ${formatCount(ranked.noSkillRequests)} requests with no skill loaded cost ${formatCost(ranked.noSkillCost)} and sit outside this ranking.`}
+            {ranked.noSkillRequests === 0
+              ? 'Share is of skill-attributed cost. Every request in view has a skill loaded, so it is also the share of everything.'
+              : `Share is of skill-attributed cost, not of everything. The ${formatCount(ranked.noSkillRequests)} requests with no skill loaded cost ${formatCost(ranked.noSkillCost)} and sit outside this ranking.`}
           </p>
         </div>
 
@@ -489,7 +495,7 @@ export function Skills({ events, toolCalls, loading = false }: SkillsProps) {
           <CardHead
             title="Plugins by cost"
             total={formatCost(plugins.cost)}
-            note={`${formatCount(plugins.count)} plugins. A plugin agent produces requests with no skill attached, so this is not the skill ranking rolled up.`}
+            note={`${plural(plugins.count, 'plugin')}. A plugin agent produces requests with no skill attached, so this is not the skill ranking rolled up.`}
           />
           <BarChart
             data={plugins.bars}
