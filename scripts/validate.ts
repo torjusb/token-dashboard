@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { UsageEvent } from '../shared/types.ts';
+import type { ToolCall, UsageEvent } from '../shared/types.ts';
 import { PRICING, WEB_SEARCH_USD } from '../server/pricing.ts';
 import type { Rate } from '../server/pricing.ts';
 import { createScanner } from '../server/scan.ts';
@@ -42,18 +42,15 @@ async function walkJsonlFiles(root: string): Promise<string[]> {
 }
 
 /**
- * A second opinion on the dedupe key, written from scratch against the raw
- * transcript format rather than calling server/parse.ts, so check 1 actually
- * catches a parse.ts bug instead of restating it.
+ * Every raw assistant line inside the window that carries usage and a usable requestId,
+ * decoded but otherwise untouched. Written from scratch against the transcript format and
+ * deliberately not calling server/parse.ts, so the checks built on it can catch a parser bug
+ * instead of restating one.
  */
-async function independentRequestIdCount(
+async function* rawAssistantLines(
   cutoff: number,
-): Promise<{ rawLines: number; distinctIds: number }> {
-  const files = await walkJsonlFiles(TRANSCRIPTS_ROOT);
-  let rawLines = 0;
-  const ids = new Set<string>();
-
-  for (const file of files) {
+): AsyncGenerator<{ rec: Record<string, unknown>; requestId: string }> {
+  for (const file of await walkJsonlFiles(TRANSCRIPTS_ROOT)) {
     try {
       if (statSync(file).mtimeMs < cutoff) continue;
     } catch {
@@ -87,9 +84,20 @@ async function independentRequestIdCount(
       const requestId = typeof rec.requestId === 'string' ? rec.requestId : message.id;
       if (typeof requestId !== 'string' || requestId.length === 0) continue;
 
-      rawLines++;
-      ids.add(requestId);
+      yield { rec, requestId };
     }
+  }
+}
+
+async function independentRequestIdCount(
+  cutoff: number,
+): Promise<{ rawLines: number; distinctIds: number }> {
+  let rawLines = 0;
+  const ids = new Set<string>();
+
+  for await (const { requestId } of rawAssistantLines(cutoff)) {
+    rawLines++;
+    ids.add(requestId);
   }
 
   return { rawLines, distinctIds: ids.size };
@@ -315,6 +323,114 @@ async function checkCoverage(store: Store): Promise<CheckResult> {
 }
 
 /**
+ * A second opinion on the tool-call grain, read straight off the raw blocks rather than
+ * through server/parse.ts, for the same reason independentRequestIdCount is: a check that
+ * calls the parser can only restate it.
+ */
+async function independentToolCallCount(cutoff: number): Promise<{
+  distinctIds: number;
+  repeatedIds: number;
+  idsPerRequest: Map<string, number>;
+}> {
+  const seen = new Set<string>();
+  const idsPerRequest = new Map<string, number>();
+  let repeatedIds = 0;
+
+  for await (const { rec, requestId } of rawAssistantLines(cutoff)) {
+    const content = (rec.message as Record<string, unknown>).content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content as Array<Record<string, unknown>>) {
+      if (block?.type !== 'tool_use') continue;
+      if (typeof block.id !== 'string' || typeof block.name !== 'string') continue;
+      if (seen.has(block.id)) {
+        repeatedIds++;
+        continue;
+      }
+      seen.add(block.id);
+      idsPerRequest.set(requestId, (idsPerRequest.get(requestId) ?? 0) + 1);
+    }
+  }
+
+  return { distinctIds: seen.size, repeatedIds, idsPerRequest };
+}
+
+async function checkToolCalls(store: Store, cutoff: number): Promise<CheckResult> {
+  const raw = await independentToolCallCount(cutoff);
+  const stored = store.toolCallsSince(0);
+  const storeCount = store.countToolCalls();
+  const error = pct(storeCount, raw.distinctIds);
+
+  const requestIds = new Set(store.eventsSince(0).map((e) => e.requestId));
+  const orphans = stored.filter((c) => !requestIds.has(c.requestId));
+
+  const dist = new Map<number, number>();
+  for (const n of raw.idsPerRequest.values()) dist.set(n, (dist.get(n) ?? 0) + 1);
+  const histogram = [...dist.entries()].sort((a, b) => a[0] - b[0]).map(([n, c]) => `${n}:${c}`);
+
+  const pass = raw.distinctIds > 0 && error <= 0.5 && orphans.length === 0;
+
+  return {
+    name: 'TOOLCALLS',
+    pass,
+    lines: [
+      `independent distinct tool_use ids: ${raw.distinctIds}`,
+      `raw ids seen more than once (session resume): ${raw.repeatedIds}`,
+      `store countToolCalls(): ${storeCount}`,
+      `error vs independent count: ${error.toFixed(3)}% (fail above 0.5%)`,
+      `stored calls whose requestId is missing from events: ${orphans.length} (any is a failure)`,
+      ...orphans.slice(0, 5).map((c) => `  ${c.id} -> ${c.requestId}`),
+      `requests issuing tool calls: ${raw.idsPerRequest.size}`,
+      `ids per request: ${histogram.join(', ')}`,
+    ],
+  };
+}
+
+/**
+ * The per-skill cost number is a sum over every request a skill was live for, so it is only
+ * meaningful if a request carries one skill. Claude Code writes the same request once per
+ * content block, and nothing stops those copies from disagreeing, so prove they do not
+ * rather than assume it: the store's insert-or-ignore upsert would silently keep whichever
+ * copy landed first.
+ */
+async function checkAttribution(cutoff: number): Promise<CheckResult> {
+  const perSkill = new Map<string, Set<string>>();
+  const skillsByRequest = new Map<string, Set<string>>();
+  const requests = new Set<string>();
+
+  for await (const { rec, requestId } of rawAssistantLines(cutoff)) {
+    requests.add(requestId);
+    const skill = rec.attributionSkill;
+    if (typeof skill !== 'string') continue;
+
+    let values = skillsByRequest.get(requestId);
+    if (values === undefined) skillsByRequest.set(requestId, (values = new Set()));
+    values.add(skill);
+
+    let ids = perSkill.get(skill);
+    if (ids === undefined) perSkill.set(skill, (ids = new Set()));
+    ids.add(requestId);
+  }
+
+  const conflicts = [...skillsByRequest].filter(([, values]) => values.size > 1);
+  const coverage = requests.size === 0 ? 0 : skillsByRequest.size / requests.size;
+  const top = [...perSkill.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 10);
+  const pass = requests.size > 0 && conflicts.length === 0;
+
+  return {
+    name: 'ATTRIBUTION',
+    pass,
+    lines: [
+      `requests with two distinct attributionSkill values: ${conflicts.length} (any is a failure)`,
+      ...conflicts.slice(0, 5).map(([id, values]) => `  ${id}: ${[...values].join(' | ')}`),
+      `skill-attributed requests: ${skillsByRequest.size} of ${requests.size} ` +
+        `(${(coverage * 100).toFixed(1)}%), ${perSkill.size} distinct skills`,
+      'top skills by request count:',
+      ...top.map(([skill, ids]) => `  ${skill.padEnd(32)} ${ids.size}`),
+    ],
+  };
+}
+
+/**
  * Claude Code may be running on this machine while the validator runs, so a genuinely new
  * request can land between the two counts. Re-ingesting a request the store already held is
  * the real failure; an arrival stamped after the check began is not. The grace window covers
@@ -325,6 +441,7 @@ const LIVE_ARRIVAL_GRACE_MS = 120_000;
 async function checkIdempotency(store: Store): Promise<CheckResult> {
   const checkStartedAt = Date.now() - LIVE_ARRIVAL_GRACE_MS;
   const before = new Set(store.eventsSince(0).map((e) => e.requestId));
+  const beforeCalls = new Set(store.toolCallsSince(0).map((c) => c.id));
   const scanner = createScanner({
     root: TRANSCRIPTS_ROOT,
     store,
@@ -335,17 +452,23 @@ async function checkIdempotency(store: Store): Promise<CheckResult> {
   const added = store.eventsSince(0).filter((e) => !before.has(e.requestId));
   const reingested = added.filter((e) => e.ts < checkStartedAt);
   const arrived = added.length - reingested.length;
-  const pass = reingested.length === 0;
+
+  const addedCalls = store.toolCallsSince(0).filter((c) => !beforeCalls.has(c.id));
+  const reingestedCalls = addedCalls.filter((c) => c.ts < checkStartedAt);
+  const pass = reingested.length === 0 && reingestedCalls.length === 0;
 
   return {
     name: 'IDEMPOTENCY',
     pass,
     lines: [
-      `events before rerun: ${before.size}`,
+      `events before rerun: ${before.size}, tool calls before rerun: ${beforeCalls.size}`,
       `second backfill reported: ${reported} new`,
-      `genuinely new arrivals during the check: ${arrived}`,
+      `genuinely new arrivals during the check: ${arrived} events, ` +
+        `${addedCalls.length - reingestedCalls.length} tool calls`,
       `re-ingested pre-existing requests: ${reingested.length} (any is a failure)`,
       ...reingested.slice(0, 5).map((e) => `  ${e.requestId} ts ${new Date(e.ts).toISOString()}`),
+      `re-ingested pre-existing tool calls: ${reingestedCalls.length} (any is a failure)`,
+      ...reingestedCalls.slice(0, 5).map((c: ToolCall) => `  ${c.id} ts ${new Date(c.ts).toISOString()}`),
     ],
   };
 }
@@ -445,6 +568,8 @@ async function main(): Promise<void> {
     const results: CheckResult[] = [];
     results.push(await checkDedupe(store, cutoff));
     results.push(checkInvariants(store, cutoff));
+    results.push(await checkToolCalls(store, cutoff));
+    results.push(await checkAttribution(cutoff));
     results.push(await checkPricing());
     results.push(await checkCoverage(store));
     results.push(await checkIdempotency(store));

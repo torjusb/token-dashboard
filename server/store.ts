@@ -236,8 +236,9 @@ export function openStore(dbPath: string): Store {
         const result = insertEvent.run(
           e.requestId, e.ts, e.sessionId, e.project, e.cwd, e.gitBranch, e.slug,
           e.model, e.effort, e.serviceTier, e.isSidechain ? 1 : 0, e.attributionAgent,
-          e.input, e.output, e.thinking, e.cacheRead, e.cacheWrite5m, e.cacheWrite1h,
-          e.webSearch, e.webFetch, e.cost, e.version,
+          e.attributionSkill, e.attributionPlugin, e.input, e.output, e.thinking,
+          e.cacheRead, e.cacheWrite5m, e.cacheWrite1h, e.webSearch, e.webFetch,
+          e.cost, e.version,
         );
         if (Number(result.changes) > 0) inserted.push(e);
       }
