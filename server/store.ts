@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import type { SQLInputValue } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { UsageEvent, SessionCost, ToolCall, Effort } from '../shared/types.ts';
@@ -18,12 +19,59 @@ export type Store = {
   close(): void;
 };
 
-const EVENT_COLUMNS = [
-  'requestId', 'ts', 'sessionId', 'project', 'cwd', 'gitBranch', 'slug', 'model',
-  'effort', 'serviceTier', 'isSidechain', 'attributionAgent', 'attributionSkill',
-  'attributionPlugin', 'input', 'output', 'thinking', 'cacheRead', 'cacheWrite5m',
-  'cacheWrite1h', 'webSearch', 'webFetch', 'cost', 'version',
-] as const;
+/**
+ * Column name to the value bound under it. The insert's column list and its parameter list
+ * are both generated from this one mapping, so they cannot drift apart: binding by position
+ * against a separate column list silently shifted every value one column left when this table
+ * last grew, and wrote a null cost for every event. Keying on the record type makes the
+ * compiler demand an entry for each field, so a new field cannot reach the table unbound.
+ */
+type Bindings<T> = { [K in keyof Required<T>]: (value: T) => SQLInputValue };
+
+function columnsOf<T>(bindings: Bindings<T>): Array<keyof T> {
+  return Object.keys(bindings) as Array<keyof T>;
+}
+
+function bind<T>(bindings: Bindings<T>, columns: Array<keyof T>, value: T): SQLInputValue[] {
+  return columns.map((column) => bindings[column](value));
+}
+
+const EVENT_BINDINGS: Bindings<UsageEvent> = {
+  requestId: (e) => e.requestId,
+  ts: (e) => e.ts,
+  sessionId: (e) => e.sessionId,
+  project: (e) => e.project,
+  cwd: (e) => e.cwd,
+  gitBranch: (e) => e.gitBranch,
+  slug: (e) => e.slug,
+  model: (e) => e.model,
+  effort: (e) => e.effort,
+  serviceTier: (e) => e.serviceTier,
+  isSidechain: (e) => (e.isSidechain ? 1 : 0),
+  attributionAgent: (e) => e.attributionAgent,
+  attributionSkill: (e) => e.attributionSkill,
+  attributionPlugin: (e) => e.attributionPlugin,
+  input: (e) => e.input,
+  output: (e) => e.output,
+  thinking: (e) => e.thinking,
+  cacheRead: (e) => e.cacheRead,
+  cacheWrite5m: (e) => e.cacheWrite5m,
+  cacheWrite1h: (e) => e.cacheWrite1h,
+  webSearch: (e) => e.webSearch,
+  webFetch: (e) => e.webFetch,
+  cost: (e) => e.cost,
+  version: (e) => e.version,
+};
+
+const TOOL_CALL_BINDINGS: Bindings<ToolCall> = {
+  id: (c) => c.id,
+  requestId: (c) => c.requestId,
+  ts: (c) => c.ts,
+  name: (c) => c.name,
+};
+
+const EVENT_COLUMNS = columnsOf(EVENT_BINDINGS);
+const TOOL_CALL_COLUMNS = columnsOf(TOOL_CALL_BINDINGS);
 
 type EventRow = {
   requestId: string;
@@ -237,8 +285,8 @@ export function openStore(dbPath: string): Store {
   `);
 
   const insertToolCall = db.prepare(`
-    INSERT INTO tool_calls (id, requestId, ts, name)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO tool_calls (${TOOL_CALL_COLUMNS.join(', ')})
+    VALUES (${TOOL_CALL_COLUMNS.map(() => '?').join(', ')})
     ON CONFLICT(id) DO NOTHING
   `);
 
@@ -261,13 +309,7 @@ export function openStore(dbPath: string): Store {
     db.exec('BEGIN');
     try {
       for (const e of events) {
-        const result = insertEvent.run(
-          e.requestId, e.ts, e.sessionId, e.project, e.cwd, e.gitBranch, e.slug,
-          e.model, e.effort, e.serviceTier, e.isSidechain ? 1 : 0, e.attributionAgent,
-          e.attributionSkill, e.attributionPlugin, e.input, e.output, e.thinking,
-          e.cacheRead, e.cacheWrite5m, e.cacheWrite1h, e.webSearch, e.webFetch,
-          e.cost, e.version,
-        );
+        const result = insertEvent.run(...bind(EVENT_BINDINGS, EVENT_COLUMNS, e));
         if (Number(result.changes) > 0) inserted.push(e);
       }
       db.exec('COMMIT');
@@ -284,7 +326,7 @@ export function openStore(dbPath: string): Store {
     db.exec('BEGIN');
     try {
       for (const c of calls) {
-        const result = insertToolCall.run(c.id, c.requestId, c.ts, c.name);
+        const result = insertToolCall.run(...bind(TOOL_CALL_BINDINGS, TOOL_CALL_COLUMNS, c));
         if (Number(result.changes) > 0) inserted.push(c);
       }
       db.exec('COMMIT');

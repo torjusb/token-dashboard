@@ -40,6 +40,11 @@ type SweepStats = {
 async function listTranscripts(root: string): Promise<string[]> {
   try {
     const entries = await readdir(root, { recursive: true, withFileTypes: true });
+
+    // isFile() excludes symlinks, which is load-bearing rather than incidental: one subagent
+    // transcript is reachable both at its real path and through a symlink left by the session
+    // that spawned it, so following symlinks would read the same 26 requests and 78 tool calls
+    // twice under two different paths.
     const paths = entries
       .filter((entry) => entry.isFile() && entry.name.endsWith('.jsonl'))
       .map((entry) => join(entry.parentPath, entry.name));
