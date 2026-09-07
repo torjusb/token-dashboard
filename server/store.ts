@@ -1,25 +1,28 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { UsageEvent, SessionCost, Effort } from '../shared/types.ts';
+import type { UsageEvent, SessionCost, ToolCall, Effort } from '../shared/types.ts';
 
 export type Store = {
   upsertEvents(events: UsageEvent[]): UsageEvent[];
   upsertSessionCosts(costs: SessionCost[]): SessionCost[];
+  upsertToolCalls(calls: ToolCall[]): ToolCall[];
   eventsSince(tsMs: number): UsageEvent[];
   allSessionCosts(): SessionCost[];
+  toolCallsSince(tsMs: number): ToolCall[];
   getOffset(filePath: string): { offset: number; size: number; mtimeMs: number } | null;
   setOffset(filePath: string, offset: number, size: number, mtimeMs: number): void;
   countEvents(): number;
+  countToolCalls(): number;
   pruneBefore(tsMs: number): number;
   close(): void;
 };
 
 const EVENT_COLUMNS = [
   'requestId', 'ts', 'sessionId', 'project', 'cwd', 'gitBranch', 'slug', 'model',
-  'effort', 'serviceTier', 'isSidechain', 'attributionAgent', 'input', 'output',
-  'thinking', 'cacheRead', 'cacheWrite5m', 'cacheWrite1h', 'webSearch', 'webFetch',
-  'cost', 'version',
+  'effort', 'serviceTier', 'isSidechain', 'attributionAgent', 'attributionSkill',
+  'attributionPlugin', 'input', 'output', 'thinking', 'cacheRead', 'cacheWrite5m',
+  'cacheWrite1h', 'webSearch', 'webFetch', 'cost', 'version',
 ] as const;
 
 type EventRow = {
@@ -35,6 +38,8 @@ type EventRow = {
   serviceTier: string | null;
   isSidechain: number;
   attributionAgent: string | null;
+  attributionSkill: string | null;
+  attributionPlugin: string | null;
   input: number;
   output: number;
   thinking: number;
@@ -58,6 +63,13 @@ type SessionCostRow = {
   byModel: string;
 };
 
+type ToolCallRow = {
+  id: string;
+  requestId: string;
+  ts: number;
+  name: string;
+};
+
 function rowToEvent(row: EventRow): UsageEvent {
   return {
     requestId: row.requestId,
@@ -72,6 +84,8 @@ function rowToEvent(row: EventRow): UsageEvent {
     serviceTier: row.serviceTier,
     isSidechain: row.isSidechain !== 0,
     attributionAgent: row.attributionAgent,
+    attributionSkill: row.attributionSkill,
+    attributionPlugin: row.attributionPlugin,
     input: row.input,
     output: row.output,
     thinking: row.thinking,
@@ -124,6 +138,8 @@ export function openStore(dbPath: string): Store {
       serviceTier TEXT,
       isSidechain INTEGER NOT NULL,
       attributionAgent TEXT,
+      attributionSkill TEXT,
+      attributionPlugin TEXT,
       input INTEGER NOT NULL,
       output INTEGER NOT NULL,
       thinking INTEGER NOT NULL,
@@ -151,6 +167,16 @@ export function openStore(dbPath: string): Store {
       byModel TEXT NOT NULL
     )
   `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS tool_calls (
+      id TEXT PRIMARY KEY,
+      requestId TEXT NOT NULL,
+      ts INTEGER NOT NULL,
+      name TEXT NOT NULL
+    )
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_tool_calls_ts ON tool_calls(ts)');
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS offsets (
@@ -182,7 +208,14 @@ export function openStore(dbPath: string): Store {
       byModel = excluded.byModel
   `);
 
+  const insertToolCall = db.prepare(`
+    INSERT INTO tool_calls (id, requestId, ts, name)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(id) DO NOTHING
+  `);
+
   const selectEventsSince = db.prepare('SELECT * FROM events WHERE ts >= ? ORDER BY ts ASC');
+  const selectToolCallsSince = db.prepare('SELECT * FROM tool_calls WHERE ts >= ? ORDER BY ts ASC');
   const selectAllSessionCosts = db.prepare('SELECT * FROM session_costs');
   const selectOffset = db.prepare('SELECT offset, size, mtimeMs FROM offsets WHERE filePath = ?');
   const upsertOffset = db.prepare(`
@@ -190,7 +223,9 @@ export function openStore(dbPath: string): Store {
     ON CONFLICT(filePath) DO UPDATE SET offset = excluded.offset, size = excluded.size, mtimeMs = excluded.mtimeMs
   `);
   const selectCount = db.prepare('SELECT COUNT(*) AS c FROM events');
+  const selectToolCallCount = db.prepare('SELECT COUNT(*) AS c FROM tool_calls');
   const deleteBefore = db.prepare('DELETE FROM events WHERE ts < ?');
+  const deleteToolCallsBefore = db.prepare('DELETE FROM tool_calls WHERE ts < ?');
 
   function upsertEvents(events: UsageEvent[]): UsageEvent[] {
     const inserted: UsageEvent[] = [];
@@ -205,6 +240,23 @@ export function openStore(dbPath: string): Store {
           e.webSearch, e.webFetch, e.cost, e.version,
         );
         if (Number(result.changes) > 0) inserted.push(e);
+      }
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+    return inserted;
+  }
+
+  function upsertToolCalls(calls: ToolCall[]): ToolCall[] {
+    const inserted: ToolCall[] = [];
+    if (calls.length === 0) return inserted;
+    db.exec('BEGIN');
+    try {
+      for (const c of calls) {
+        const result = insertToolCall.run(c.id, c.requestId, c.ts, c.name);
+        if (Number(result.changes) > 0) inserted.push(c);
       }
       db.exec('COMMIT');
     } catch (err) {
@@ -248,11 +300,15 @@ export function openStore(dbPath: string): Store {
   return {
     upsertEvents,
     upsertSessionCosts,
+    upsertToolCalls,
     eventsSince(tsMs: number): UsageEvent[] {
       return (selectEventsSince.all(tsMs) as EventRow[]).map(rowToEvent);
     },
     allSessionCosts(): SessionCost[] {
       return (selectAllSessionCosts.all() as SessionCostRow[]).map(rowToSessionCost);
+    },
+    toolCallsSince(tsMs: number): ToolCall[] {
+      return selectToolCallsSince.all(tsMs) as ToolCallRow[];
     },
     getOffset(filePath: string) {
       const row = selectOffset.get(filePath) as { offset: number; size: number; mtimeMs: number } | undefined;
@@ -265,8 +321,14 @@ export function openStore(dbPath: string): Store {
       const row = selectCount.get() as { c: number };
       return row.c;
     },
+    countToolCalls(): number {
+      const row = selectToolCallCount.get() as { c: number };
+      return row.c;
+    },
     pruneBefore(tsMs: number): number {
       const result = deleteBefore.run(tsMs);
+      deleteToolCallsBefore.run(tsMs);
+      // Callers report this as an event count, so the tool-call rows are not added in.
       return Number(result.changes);
     },
     close(): void {

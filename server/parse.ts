@@ -1,7 +1,9 @@
 import { EFFORTS } from '../shared/types.ts';
-import type { Effort, SessionCost, UsageEvent } from '../shared/types.ts';
+import type { Effort, SessionCost, ToolCall, UsageEvent } from '../shared/types.ts';
 
-export type ParsedLine = { kind: 'usage'; event: Omit<UsageEvent, 'cost'> } | { kind: 'cost'; cost: SessionCost };
+export type ParsedLine =
+  | { kind: 'usage'; event: Omit<UsageEvent, 'cost'>; toolCalls: ToolCall[] }
+  | { kind: 'cost'; cost: SessionCost };
 
 type RawUsage = {
   input_tokens?: unknown;
@@ -25,9 +27,13 @@ type RawAssistantLine = {
   effort?: unknown;
   isSidechain?: unknown;
   attributionAgent?: unknown;
+  attributionSkill?: unknown;
+  attributionPlugin?: unknown;
   version?: unknown;
-  message?: { id?: unknown; model?: unknown; usage?: RawUsage };
+  message?: { id?: unknown; model?: unknown; usage?: RawUsage; content?: unknown };
 };
+
+type RawContentBlock = { type?: unknown; id?: unknown; name?: unknown };
 
 type RawCostStateLine = {
   type: 'cost-state';
@@ -94,6 +100,8 @@ function parseUsageEvent(raw: RawAssistantLine): ParsedLine | null {
     serviceTier: str(usage.service_tier),
     isSidechain: raw.isSidechain === true,
     attributionAgent: str(raw.attributionAgent),
+    attributionSkill: str(raw.attributionSkill),
+    attributionPlugin: str(raw.attributionPlugin),
     input: num(usage.input_tokens),
     output: num(usage.output_tokens),
     thinking: num(usage.output_tokens_details?.thinking_tokens),
@@ -105,7 +113,21 @@ function parseUsageEvent(raw: RawAssistantLine): ParsedLine | null {
     version: str(raw.version),
   };
 
-  return { kind: 'usage', event };
+  return { kind: 'usage', event, toolCalls: parseToolCalls(raw.message?.content, event.requestId, event.ts) };
+}
+
+function parseToolCalls(content: unknown, requestId: string, ts: number): ToolCall[] {
+  if (!Array.isArray(content)) return [];
+
+  const calls: ToolCall[] = [];
+  for (const block of content as RawContentBlock[]) {
+    if (block?.type !== 'tool_use') continue;
+    const id = str(block.id);
+    const name = str(block.name);
+    if (id === null || name === null) continue;
+    calls.push({ id, requestId, ts, name });
+  }
+  return calls;
 }
 
 function parseCostState(raw: RawCostStateLine): ParsedLine | null {
