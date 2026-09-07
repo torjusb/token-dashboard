@@ -208,16 +208,20 @@ export function Skills({ events, toolCalls, loading = false }: SkillsProps) {
     const unattributed = rows.find((row) => row.key === NO_SKILL);
     let cost = 0;
     let requests = 0;
+    let tokens = 0;
     for (const row of attributed) {
       cost += row.cost;
       requests += row.requests;
+      tokens += row.totalTokens;
     }
     return {
       rows: attributed,
       cost,
       requests,
+      tokens,
       noSkillCost: unattributed?.cost ?? 0,
       noSkillRequests: unattributed?.requests ?? 0,
+      noSkillTokens: unattributed?.totalTokens ?? 0,
     };
   }, [events]);
 
@@ -247,17 +251,20 @@ export function Skills({ events, toolCalls, loading = false }: SkillsProps) {
     const subEvents = skilled.filter((event) => event.isSidechain);
     const main = totals(mainEvents);
     const sub = totals(subEvents);
-    const costByKey = (scoped: readonly UsageEvent[]) =>
-      new Map(bySkill(scoped).map((row) => [String(row.key), row.cost] as const));
-    const mainCost = costByKey(mainEvents);
-    const subCost = costByKey(subEvents);
+    const byKey = (scoped: readonly UsageEvent[]) =>
+      new Map(bySkill(scoped).map((row) => [String(row.key), row] as const));
+    const mainRows = byKey(mainEvents);
+    const subRows = byKey(subEvents);
     const rows = ranked.rows.slice(0, SKILL_SPLIT_TOP).map((row) => {
       const name = String(row.key);
+      const sub = subRows.get(name);
       return {
         name,
-        main: mainCost.get(name) ?? 0,
-        sub: subCost.get(name) ?? 0,
+        main: mainRows.get(name)?.cost ?? 0,
+        sub: sub?.cost ?? 0,
         cost: row.cost,
+        subRequests: sub?.requests ?? 0,
+        requests: row.requests,
       };
     });
     const whole = main.cost + sub.cost;
@@ -337,13 +344,15 @@ export function Skills({ events, toolCalls, loading = false }: SkillsProps) {
               <span className="tile-label">With a skill</span>
               <span className="tile-value">{formatCost(ranked.cost)}</span>
               <span className="tile-delta">
-                {`${formatCount(ranked.requests)} requests, ${formatPercent(attributedShare, 1)} of all`}
+                {`${formatCount(ranked.requests)} requests, ${formatCompact(ranked.tokens)} tokens, ${formatPercent(attributedShare, 1)} of all`}
               </span>
             </div>
             <div className="tile">
               <span className="tile-label">No skill loaded</span>
               <span className="tile-value">{formatCost(ranked.noSkillCost)}</span>
-              <span className="tile-delta">{`${formatCount(ranked.noSkillRequests)} requests`}</span>
+              <span className="tile-delta">
+                {`${formatCount(ranked.noSkillRequests)} requests, ${formatCompact(ranked.noSkillTokens)} tokens`}
+              </span>
             </div>
             <div className="tile">
               <span className="tile-label">Priciest skill</span>
@@ -436,7 +445,8 @@ export function Skills({ events, toolCalls, loading = false }: SkillsProps) {
                   <th style={{ width: '26%' }}>Split</th>
                   <th className="num">Main</th>
                   <th className="num">Subagents</th>
-                  <th className="num">In subagents</th>
+                  <th className="num">Sub of cost</th>
+                  <th className="num">Sub of requests</th>
                 </tr>
               </thead>
               <tbody>
@@ -457,6 +467,9 @@ export function Skills({ events, toolCalls, loading = false }: SkillsProps) {
                     <td className="num muted">
                       {formatPercent(row.cost > 0 ? row.sub / row.cost : 0, 0)}
                     </td>
+                    <td className="num muted">
+                      {formatPercent(row.requests > 0 ? row.subRequests / row.requests : 0, 0)}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -466,7 +479,9 @@ export function Skills({ events, toolCalls, loading = false }: SkillsProps) {
           <p className="muted" style={NOTE_STYLE}>
             A skill that fans out subagents keeps spending after the turn that invoked it. The
             subagent requests carry the skill attribution too, so this is the same money as the
-            ranking above, cut by where it was spent.
+            ranking above, cut by where it was spent. The two share columns disagree on purpose:
+            subagent requests are usually cheaper than the main-thread turns that dispatch them,
+            so a skill can be half its requests and a third of its cost.
           </p>
         </div>
 
