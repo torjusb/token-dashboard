@@ -8,6 +8,7 @@ export type Filters = {
   to: number | null;
   projects: string[];
   models: string[];
+  skills: string[];
   agentScope: AgentScope;
 };
 
@@ -24,6 +25,7 @@ export const DEFAULT_FILTERS: Filters = {
   to: null,
   projects: [],
   models: [],
+  skills: [],
   agentScope: 'all',
 };
 
@@ -47,6 +49,7 @@ function sanitize(value: unknown): Filters {
     to: timestamp(raw['to']),
     projects: names(raw['projects']),
     models: names(raw['models']),
+    skills: names(raw['skills']),
     agentScope: scope === 'main' || scope === 'sub' ? scope : 'all',
   };
 }
@@ -66,6 +69,7 @@ function isDefault(filters: Filters): boolean {
     filters.to === null &&
     filters.projects.length === 0 &&
     filters.models.length === 0 &&
+    filters.skills.length === 0 &&
     filters.agentScope === 'all'
   );
 }
