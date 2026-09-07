@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
-import type { ServerMessage, SessionCost, UsageEvent } from '../../../shared/types.ts';
+import type { ServerMessage, SessionCost, ToolCall, UsageEvent } from '../../../shared/types.ts';
 
 export type StreamStatus = 'connecting' | 'live' | 'reconnecting' | 'error';
 
 export type LiveUsage = {
   events: UsageEvent[];
+  toolCalls: ToolCall[];
   sessionCosts: SessionCost[];
   serverNow: number;
   status: StreamStatus;
@@ -18,33 +19,55 @@ type Published = Omit<LiveUsage, 'serverNow' | 'status'>;
 type Accumulator = {
   events: UsageEvent[];
   seen: Set<string>;
+  toolCalls: ToolCall[];
+  seenTools: Set<string>;
   costs: Map<string, SessionCost>;
   backfilling: boolean;
 };
 
 function createAccumulator(): Accumulator {
-  return { events: [], seen: new Set(), costs: new Map(), backfilling: false };
+  return {
+    events: [],
+    seen: new Set(),
+    toolCalls: [],
+    seenTools: new Set(),
+    costs: new Map(),
+    backfilling: false,
+  };
 }
 
-function insert(acc: Accumulator, event: UsageEvent): boolean {
-  if (acc.seen.has(event.requestId)) return false;
-  acc.seen.add(event.requestId);
+function insert<T extends { ts: number }>(
+  rows: T[],
+  seen: Set<string>,
+  id: string,
+  row: T,
+): boolean {
+  if (seen.has(id)) return false;
+  seen.add(id);
 
-  const last = acc.events[acc.events.length - 1];
-  if (last === undefined || last.ts <= event.ts) {
-    acc.events.push(event);
+  const last = rows[rows.length - 1];
+  if (last === undefined || last.ts <= row.ts) {
+    rows.push(row);
     return true;
   }
 
   let lo = 0;
-  let hi = acc.events.length;
+  let hi = rows.length;
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
-    if (acc.events[mid]!.ts <= event.ts) lo = mid + 1;
+    if (rows[mid]!.ts <= row.ts) lo = mid + 1;
     else hi = mid;
   }
-  acc.events.splice(lo, 0, event);
+  rows.splice(lo, 0, row);
   return true;
+}
+
+function insertEvent(acc: Accumulator, event: UsageEvent): boolean {
+  return insert(acc.events, acc.seen, event.requestId, event);
+}
+
+function insertTool(acc: Accumulator, call: ToolCall): boolean {
+  return insert(acc.toolCalls, acc.seenTools, call.id, call);
 }
 
 function accept(acc: Accumulator, msg: ServerMessage): boolean {
@@ -52,15 +75,21 @@ function accept(acc: Accumulator, msg: ServerMessage): boolean {
     case 'snapshot': {
       acc.events = [];
       acc.seen.clear();
+      acc.toolCalls = [];
+      acc.seenTools.clear();
       acc.costs.clear();
       acc.backfilling = msg.backfilling;
-      for (const event of msg.events) insert(acc, event);
+      for (const event of msg.events) insertEvent(acc, event);
+      for (const call of msg.toolCalls ?? []) insertTool(acc, call);
       for (const cost of msg.sessionCosts) acc.costs.set(cost.sessionId, cost);
       return true;
     }
     case 'delta': {
       let changed = false;
-      for (const event of msg.events) changed = insert(acc, event) || changed;
+      for (const event of msg.events) changed = insertEvent(acc, event) || changed;
+      // A server older than the tool-call grain sends no `toolCalls` at all, and one
+      // missing frame must not take the whole stream down with a TypeError.
+      for (const call of msg.toolCalls ?? []) changed = insertTool(acc, call) || changed;
       for (const cost of msg.sessionCosts) {
         acc.costs.set(cost.sessionId, cost);
         changed = true;
@@ -81,6 +110,7 @@ function publish(acc: Accumulator): Published {
   const last = acc.events[acc.events.length - 1];
   return {
     events: acc.events.slice(),
+    toolCalls: acc.toolCalls.slice(),
     sessionCosts: [...acc.costs.values()],
     backfilling: acc.backfilling,
     lastEventAt: last === undefined ? null : last.ts,
