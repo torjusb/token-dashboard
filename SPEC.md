@@ -19,7 +19,8 @@ of transcript history, then updates live as new requests land, with no page refr
 | Skill attribution is consistent across a request's duplicate lines | all 6,813 skill-attributed requestIds carry exactly 1 distinct value |
 | `attributionPlugin` is **not** derivable from the skill name prefix | pstack: 9,584 lines vs 7,594 from pstack skills |
 | `message.content` is always a list of length 1 | 38,363 of 38,363 assistant lines |
-| A request issues 1 to 13 `tool_use` blocks | 21,359 distinct ids over 19,190 requests |
+| A request issues 1 to 13 `tool_use` blocks | 21,513 distinct ids over 19,335 requests |
+| One transcript is reachable by two paths, a symlink beside its real file | 165 tool-use ids repeat under session resume once the symlink is excluded, 243 if it is not |
 | `attributionMcpServer` / `attributionMcpTool` disagree with the block on their own line | 203 claude-in-chrome calls with a null server; tool field names a different tool 60+ times per pair |
 
 Consequences: **dedupe by `requestId` or every metric doubles.** `thinking` is a subset of
@@ -144,6 +145,15 @@ testing one thing:
 ## What the measurements turned up
 
 Three findings that changed the design, all reproducible through the validator:
+
+**The transcript walk must not follow symlinks.** One subagent transcript under
+`rema-1000-prefetch` exists as a symlink in one session directory pointing at the real file in
+another, and both directories are inside the projects root. `readdir` with `withFileTypes`
+reports the symlink as not-a-file, so `entry.isFile()` in `server/scan.ts` skips it and the real
+path is ingested exactly once. That filter looks like an oversight and is load-bearing:
+"fixing" it to follow symlinks would read 26 requests and 78 tool calls twice. The primary keys
+would absorb the duplicates, but the raw-versus-distinct ratios the validator reports would
+drift and stop meaning anything.
 
 **Session resume duplicates requests.** Resuming a session copies its earlier requests into the
 new transcript, so about 1% of `requestId`s appear in two files under two different
