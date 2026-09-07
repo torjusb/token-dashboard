@@ -1,14 +1,15 @@
 import { Component, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ErrorInfo, ReactNode } from 'react';
-import type { SessionCost, UsageEvent } from '../../shared/types.ts';
+import type { SessionCost, ToolCall, UsageEvent } from '../../shared/types.ts';
 import { FiltersProvider, useFilters } from './lib/filters.tsx';
 import type { AgentScope } from './lib/filters.tsx';
-import { applyFilters, distinctModels, distinctProjects } from './lib/select.ts';
+import { applyFilters, distinctModels, distinctProjects, distinctSkills } from './lib/select.ts';
 import { formatCount, formatRelative, modelLabel } from './lib/format.ts';
 import { useLiveUsage } from './lib/stream.ts';
 import type { StreamStatus } from './lib/stream.ts';
 import { Overview } from './panels/Overview.tsx';
 import { Breakdown } from './panels/Breakdown.tsx';
+import { Skills } from './panels/Skills.tsx';
 import { Cache } from './panels/Cache.tsx';
 import { Sessions } from './panels/Sessions.tsx';
 import { Feed } from './panels/Feed.tsx';
@@ -16,6 +17,7 @@ import { Feed } from './panels/Feed.tsx';
 const TABS = [
   { id: 'overview', label: 'Overview' },
   { id: 'breakdown', label: 'Breakdown' },
+  { id: 'skills', label: 'Skills' },
   { id: 'cache', label: 'Cache' },
   { id: 'sessions', label: 'Sessions' },
   { id: 'feed', label: 'Feed' },
@@ -23,6 +25,7 @@ const TABS = [
 
 type PanelData = {
   events: UsageEvent[];
+  toolCalls: ToolCall[];
   sessionCosts: SessionCost[];
   serverNow: number;
   status: StreamStatus;
@@ -32,7 +35,7 @@ type PanelData = {
 };
 
 // A switch rather than a component registry. Each panel takes only what it needs, and a
-// shared props type would force every one of them to widen to the union of all five.
+// shared props type would force every one of them to widen to the union of all six.
 function renderPanel(id: TabId, data: PanelData): ReactNode {
   switch (id) {
     case 'overview':
@@ -48,6 +51,10 @@ function renderPanel(id: TabId, data: PanelData): ReactNode {
       );
     case 'breakdown':
       return <Breakdown events={data.events} loading={data.backfilling} />;
+    case 'skills':
+      return (
+        <Skills events={data.events} toolCalls={data.toolCalls} loading={data.backfilling} />
+      );
     case 'cache':
       return <Cache events={data.events} loading={data.backfilling} />;
     case 'sessions':
@@ -310,6 +317,7 @@ function FilterBar({
   onResetAll,
   projectOptions,
   modelOptions,
+  skillOptions,
   matched,
   total,
 }: {
@@ -318,6 +326,7 @@ function FilterBar({
   onResetAll: () => void;
   projectOptions: ReadonlyArray<{ value: string; label: string }>;
   modelOptions: ReadonlyArray<{ value: string; label: string }>;
+  skillOptions: ReadonlyArray<{ value: string; label: string }>;
   matched: number;
   total: number;
 }) {
@@ -367,6 +376,16 @@ function FilterBar({
           options={modelOptions}
           selected={filters.models}
           onChange={(models) => patch({ models })}
+        />
+      </div>
+
+      <div className="field">
+        <span className="field-label">Skill</span>
+        <MultiSelect
+          noun="skill"
+          options={skillOptions}
+          selected={filters.skills}
+          onChange={(skills) => patch({ skills })}
         />
       </div>
 
@@ -460,6 +479,10 @@ function Dashboard() {
     () => distinctModels(usage.events).map((model) => ({ value: model, label: modelLabel(model) })),
     [usage.events],
   );
+  const skillOptions = useMemo(
+    () => distinctSkills(usage.events).map((skill) => ({ value: skill, label: skill })),
+    [usage.events],
+  );
 
   const beat = pulse(usage.status, usage.lastEventAt, usage.serverNow);
   const active = TABS.find((entry) => entry.id === tab) ?? TABS[0];
@@ -494,6 +517,7 @@ function Dashboard() {
           onResetAll={resetAll}
           projectOptions={projectOptions}
           modelOptions={modelOptions}
+          skillOptions={skillOptions}
           matched={events.length}
           total={usage.eventCount}
         />
@@ -592,6 +616,7 @@ function Dashboard() {
           <PanelBoundary key={active.id}>
             {renderPanel(active.id, {
               events,
+              toolCalls: usage.toolCalls,
               sessionCosts: usage.sessionCosts,
               serverNow: usage.serverNow,
               status: usage.status,
