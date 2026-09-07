@@ -20,8 +20,8 @@ const scanner = createScanner({
   root: join(homedir(), '.claude', 'projects'),
   store,
   windowDays: WINDOW_DAYS,
-  onEvents: (events, sessionCosts) =>
-    broadcast({ type: 'delta', serverNow: Date.now(), events, sessionCosts }),
+  onEvents: (events, sessionCosts, toolCalls) =>
+    broadcast({ type: 'delta', serverNow: Date.now(), events, sessionCosts, toolCalls }),
 });
 
 const api = createServer({
@@ -33,13 +33,16 @@ const api = createServer({
 broadcast = api.broadcast;
 
 api.server.listen(port, '127.0.0.1', () => {
-  console.log(`[main] token-dashboard on http://127.0.0.1:${port} (${store.countEvents()} events in store)`);
+  console.log(
+    `[main] token-dashboard on http://127.0.0.1:${port} ` +
+      `(${store.countEvents()} events, ${store.countToolCalls()} tool calls in store)`,
+  );
 });
 
 void (async () => {
   try {
     const fresh = await scanner.backfill();
-    console.log(`[main] backfill added ${fresh} events`);
+    console.log(`[main] backfill added ${fresh} events, store holds ${store.countToolCalls()} tool calls`);
   } catch (err) {
     console.error('[main] backfill failed:', err);
   }

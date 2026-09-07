@@ -71,6 +71,7 @@ export function createServer(opts: ServerOptions): Api {
       windowDays,
       events,
       sessionCosts: store.allSessionCosts(),
+      toolCalls: store.toolCallsSince(cutoff()),
       backfilling: backfilling(),
     };
   }
