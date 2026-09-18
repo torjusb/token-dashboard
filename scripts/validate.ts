@@ -551,11 +551,15 @@ const GAPS_OVER_CUT_LIMIT = 0.01;
 
 async function checkRuns(store: Store, cutoff: number): Promise<CheckResult> {
   const raw = await independentHumanTurnCount(cutoff);
-  const storeCount = store.countHumanTurns();
+  // Windowed, not `countHumanTurns()`. Nothing calls `pruneBefore`, so the store keeps every
+  // row it has ever ingested while this cutoff slides forward, and a whole-table count drifts
+  // above a 30-day recount by however many rows have aged out. Turns are rare enough that a
+  // handful of them is over 1% of the population, so that drift reads as a parser bug.
+  const storeCount = store.humanTurnsSince(cutoff).length;
   const error = pct(storeCount, raw.turns);
 
   const timesBySession = new Map<string, number[]>();
-  for (const e of store.eventsSince(0)) {
+  for (const e of store.eventsSince(cutoff)) {
     const list = timesBySession.get(e.sessionId);
     if (list === undefined) timesBySession.set(e.sessionId, [e.ts]);
     else list.push(e.ts);
@@ -574,7 +578,7 @@ async function checkRuns(store: Store, cutoff: number): Promise<CheckResult> {
   const overCut = gaps.filter((g) => g > IDLE_CUT_MS).length;
   const share = gaps.length === 0 ? 1 : overCut / gaps.length;
 
-  const turnSessions = new Set(store.humanTurnsSince(0).map((t) => t.sessionId));
+  const turnSessions = new Set(store.humanTurnsSince(cutoff).map((t) => t.sessionId));
   const noTurn = [...timesBySession.keys()].filter((id) => !turnSessions.has(id));
 
   const pass = raw.turns > 0 && error <= 0.5 && gaps.length > 0 && share < GAPS_OVER_CUT_LIMIT;
@@ -584,7 +588,7 @@ async function checkRuns(store: Store, cutoff: number): Promise<CheckResult> {
     pass,
     lines: [
       `independent human turns: ${raw.turns} across ${raw.sessions} sessions`,
-      `store countHumanTurns(): ${storeCount}`,
+      `store human turns in the same window: ${storeCount}`,
       `error vs independent count: ${error.toFixed(3)}% (fail above 0.5%)`,
       `teammate messages with no origin field, held out by the text check: ${raw.teammateLinesWithNoOrigin}`,
       `sessions with requests but no human turn: ${noTurn.length} of ${timesBySession.size}`,
