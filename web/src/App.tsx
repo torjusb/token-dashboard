@@ -1,6 +1,6 @@
 import { Component, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ErrorInfo, ReactNode } from 'react';
-import type { SessionCost, ToolCall, UsageEvent } from '../../shared/types.ts';
+import type { HumanTurn, SessionCost, ToolCall, UsageEvent } from '../../shared/types.ts';
 import { FiltersProvider, useFilters } from './lib/filters.tsx';
 import type { AgentScope } from './lib/filters.tsx';
 import { applyFilters, distinctModels, distinctProjects, distinctSkills } from './lib/select.ts';
@@ -27,6 +27,8 @@ type PanelData = {
   events: UsageEvent[];
   toolCalls: ToolCall[];
   sessionCosts: SessionCost[];
+  /** Unfiltered on purpose: turns are the boundaries runs are cut on, not events to select. */
+  humanTurns: HumanTurn[];
   serverNow: number;
   status: StreamStatus;
   lastEventAt: number | null;
@@ -58,7 +60,13 @@ function renderPanel(id: TabId, data: PanelData): ReactNode {
     case 'cache':
       return <Cache events={data.events} loading={data.backfilling} />;
     case 'sessions':
-      return <Sessions events={data.events} sessionCosts={data.sessionCosts} />;
+      return (
+        <Sessions
+          events={data.events}
+          sessionCosts={data.sessionCosts}
+          humanTurns={data.humanTurns}
+        />
+      );
     case 'feed':
       return <Feed events={data.events} serverNow={data.serverNow} />;
   }
@@ -618,6 +626,7 @@ function Dashboard() {
               events,
               toolCalls: usage.toolCalls,
               sessionCosts: usage.sessionCosts,
+              humanTurns: usage.humanTurns,
               serverNow: usage.serverNow,
               status: usage.status,
               lastEventAt: usage.lastEventAt,

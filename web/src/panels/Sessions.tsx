@@ -1,5 +1,10 @@
 import { useMemo, useState } from 'react';
-import { TOKEN_KINDS, type SessionCost, type UsageEvent } from '../../../shared/types.ts';
+import {
+  TOKEN_KINDS,
+  type HumanTurn,
+  type SessionCost,
+  type UsageEvent,
+} from '../../../shared/types.ts';
 import { AreaChart, Donut, type ChartPoint, type DonutSegment } from '../charts/index.ts';
 import { useFilters, type Filters } from '../lib/filters.tsx';
 import {
@@ -16,11 +21,21 @@ import {
   formatTimeLabel,
   modelLabel,
 } from '../lib/format.ts';
-import { applyFilters, byModel, sessions, totals, type SessionRow } from '../lib/select.ts';
+import {
+  applyFilters,
+  byModel,
+  sessionStats,
+  sessions,
+  totals,
+  type SessionRow,
+  type SessionStats,
+} from '../lib/select.ts';
 
 export type SessionsProps = {
   events: readonly UsageEvent[];
   sessionCosts: readonly SessionCost[];
+  /** Unfiltered. Filtering a boundary marker would fuse two runs into one. */
+  humanTurns: readonly HumanTurn[];
 };
 
 const DRIFT_LIMIT = 0.1;
@@ -187,6 +202,82 @@ function DriftCell({ value }: { value: number | null }) {
   );
 }
 
+function Tile({
+  label,
+  value,
+  note,
+  hint,
+}: {
+  label: string;
+  value: string;
+  note: string;
+  hint?: string;
+}) {
+  return (
+    <div className="tile" title={hint}>
+      <span className="tile-label">{label}</span>
+      <span className="tile-value">{value}</span>
+      <span className="tile-delta" style={clipped} title={note}>
+        {note}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * The median leads and the mean rides underneath it. They disagree by more than an order of
+ * magnitude, and the mean is the one that describes almost no session here: a laptop left open
+ * over a weekend counts every hour until the session's last request.
+ *
+ * The longest run prints its request count because the duration alone is not readable. That
+ * figure moves with the idle cut in `runs()`, and the count is what separates an agent working
+ * from a long wait that happened to stay inside the cut.
+ */
+function StatTiles({ stats, rows }: { stats: SessionStats; rows: readonly SessionRow[] }) {
+  const projects = new Map<string, string>();
+  for (const row of rows) projects.set(row.sessionId, row.project);
+
+  const longest = stats.longestSession;
+  const run = stats.longestRun;
+
+  return (
+    <div className="grid-tiles">
+      <Tile
+        label="Sessions"
+        value={formatCount(stats.sessions)}
+        note={`${formatCount(stats.runs)} runs · median ${formatDuration(stats.medianRunMs)}`}
+        hint="Sessions with at least one request in the current filters, and the runs those requests split into."
+      />
+      <Tile
+        label="Median session"
+        value={formatDuration(stats.medianSessionMs)}
+        note={`mean ${formatDuration(stats.meanSessionMs)}`}
+        hint="Half of these sessions ran shorter than the median. The mean sits an order of magnitude higher because a session left open for days keeps counting until its last request, so the median is the one that describes a working day."
+      />
+      <Tile
+        label="Longest session"
+        value={longest === null ? '–' : formatDuration(longest.durationMs)}
+        note={
+          longest === null
+            ? 'no sessions'
+            : `${longest.slug ?? longest.sessionId.slice(0, 8)} · ${longest.project}`
+        }
+        hint="First to last request in one session, idle time included."
+      />
+      <Tile
+        label="Longest unattended run"
+        value={run === null ? '–' : formatDuration(run.durationMs)}
+        note={
+          run === null
+            ? 'no runs'
+            : `${formatCount(run.requests)} requests · ${projects.get(run.sessionId) ?? 'unknown project'}`
+        }
+        hint="The longest stretch of requests with no human turn inside it. Thirty minutes of silence ends a run, and the answer moves with that cut, so the request count is what says whether the stretch was work or waiting."
+      />
+    </div>
+  );
+}
+
 function SessionDetail({
   row,
   events,
@@ -299,13 +390,17 @@ function SessionDetail({
   );
 }
 
-export function Sessions({ events, sessionCosts }: SessionsProps) {
+export function Sessions({ events, sessionCosts, humanTurns }: SessionsProps) {
   const { filters, reset, isDefault } = useFilters();
   const [sort, setSort] = useState<Sort>({ key: 'firstTs', dir: 'desc' });
   const [open, setOpen] = useState<string | null>(null);
 
   const visible = useMemo(() => applyFilters(events, filters), [events, filters]);
   const rows = useMemo(() => sessions(visible, sessionCosts), [visible, sessionCosts]);
+  const stats = useMemo(
+    () => sessionStats(visible, sessionCosts, humanTurns),
+    [visible, sessionCosts, humanTurns],
+  );
 
   const bySession = useMemo(() => {
     const map = new Map<string, UsageEvent[]>();
@@ -387,124 +482,128 @@ export function Sessions({ events, sessionCosts }: SessionsProps) {
   }
 
   return (
-    <section className="card" style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-      <div className="card-header">
-        <h2>Sessions</h2>
-        <span className="muted" style={{ fontSize: 12 }}>
-          {plural(sorted.length, 'session')}
-          {drifted.compared > 0
-            ? ` · ${drifted.off} of ${drifted.compared} priced more than 10% off Claude Code’s own total`
-            : ' · no cost-state totals to compare yet'}
-        </span>
-      </div>
+    <>
+      <StatTiles stats={stats} rows={rows} />
 
-      <div className="table-scroll" style={{ maxHeight: 560 }}>
-        <table className="table">
-          <thead>
-            <tr>
-              {COLUMNS.map((col) => {
-                const key = col.sort;
-                const active = key !== null && sort.key === key;
-                return (
-                  <th
-                    key={col.id}
-                    className={col.num ? 'num' : undefined}
-                    title={col.hint}
-                    aria-sort={active ? (sort.dir === 'asc' ? 'ascending' : 'descending') : undefined}
+      <section className="card" style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <div className="card-header">
+          <h2>Sessions</h2>
+          <span className="muted" style={{ fontSize: 12 }}>
+            {plural(sorted.length, 'session')}
+            {drifted.compared > 0
+              ? ` · ${drifted.off} of ${drifted.compared} priced more than 10% off Claude Code’s own total`
+              : ' · no cost-state totals to compare yet'}
+          </span>
+        </div>
+
+        <div className="table-scroll" style={{ maxHeight: 560 }}>
+          <table className="table">
+            <thead>
+              <tr>
+                {COLUMNS.map((col) => {
+                  const key = col.sort;
+                  const active = key !== null && sort.key === key;
+                  return (
+                    <th
+                      key={col.id}
+                      className={col.num ? 'num' : undefined}
+                      title={col.hint}
+                      aria-sort={active ? (sort.dir === 'asc' ? 'ascending' : 'descending') : undefined}
+                    >
+                      {key === null ? (
+                        col.label
+                      ) : (
+                        <button type="button" onClick={() => toggleSort(key)} style={headButton(col.num)}>
+                          <span>{col.label}</span>
+                          <span aria-hidden="true" style={{ opacity: active ? 1 : 0.25, fontSize: 9 }}>
+                            {active && sort.dir === 'asc' ? '▲' : '▼'}
+                          </span>
+                        </button>
+                      )}
+                    </th>
+                  );
+                })}
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((row) => {
+                const expanded = open === row.sessionId;
+                const mix = mixes.get(row.sessionId) ?? [];
+                return [
+                  <tr
+                    key={row.sessionId}
+                    onClick={() => toggleOpen(row.sessionId)}
+                    style={{ cursor: 'pointer' }}
                   >
-                    {key === null ? (
-                      col.label
-                    ) : (
-                      <button type="button" onClick={() => toggleSort(key)} style={headButton(col.num)}>
-                        <span>{col.label}</span>
-                        <span aria-hidden="true" style={{ opacity: active ? 1 : 0.25, fontSize: 9 }}>
-                          {active && sort.dir === 'asc' ? '▲' : '▼'}
-                        </span>
-                      </button>
-                    )}
-                  </th>
-                );
-              })}
-            </tr>
-          </thead>
-          <tbody>
-            {sorted.map((row) => {
-              const expanded = open === row.sessionId;
-              const mix = mixes.get(row.sessionId) ?? [];
-              return [
-                <tr
-                  key={row.sessionId}
-                  onClick={() => toggleOpen(row.sessionId)}
-                  style={{ cursor: 'pointer' }}
-                >
-                  <td>
-                    <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
-                      <button
-                        type="button"
-                        aria-expanded={expanded}
-                        aria-label={`${expanded ? 'Collapse' : 'Expand'} session ${row.slug ?? row.sessionId.slice(0, 8)}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          toggleOpen(row.sessionId);
-                        }}
-                        style={{
-                          background: 'none',
-                          border: 'none',
-                          cursor: 'pointer',
-                          padding: 0,
-                          width: 12,
-                          color: 'var(--text-muted)',
-                          fontSize: 9,
-                        }}
-                      >
-                        {expanded ? '▼' : '▶'}
-                      </button>
-                      <div style={{ minWidth: 0, maxWidth: 172 }}>
-                        <div style={clipped} title={row.slug ?? row.sessionId}>
-                          {row.slug === null ? (
-                            <code className="secondary">{row.sessionId.slice(0, 8)}</code>
-                          ) : (
-                            row.slug
-                          )}
-                        </div>
-                        <div
-                          className="muted"
-                          style={{ ...clipped, fontSize: 11 }}
-                          title={row.gitBranch ?? undefined}
+                    <td>
+                      <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+                        <button
+                          type="button"
+                          aria-expanded={expanded}
+                          aria-label={`${expanded ? 'Collapse' : 'Expand'} session ${row.slug ?? row.sessionId.slice(0, 8)}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleOpen(row.sessionId);
+                          }}
+                          style={{
+                            background: 'none',
+                            border: 'none',
+                            cursor: 'pointer',
+                            padding: 0,
+                            width: 12,
+                            color: 'var(--text-muted)',
+                            fontSize: 9,
+                          }}
                         >
-                          {row.gitBranch ?? 'no branch'}
+                          {expanded ? '▼' : '▶'}
+                        </button>
+                        <div style={{ minWidth: 0, maxWidth: 172 }}>
+                          <div style={clipped} title={row.slug ?? row.sessionId}>
+                            {row.slug === null ? (
+                              <code className="secondary">{row.sessionId.slice(0, 8)}</code>
+                            ) : (
+                              row.slug
+                            )}
+                          </div>
+                          <div
+                            className="muted"
+                            style={{ ...clipped, fontSize: 11 }}
+                            title={row.gitBranch ?? undefined}
+                          >
+                            {row.gitBranch ?? 'no branch'}
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  </td>
-                  <td style={{ whiteSpace: 'nowrap' }}>{row.project}</td>
-                  <td style={{ whiteSpace: 'nowrap' }}>{formatDateTime(row.firstTs)}</td>
-                  <td className="num">{formatDuration(row.durationMs)}</td>
-                  <td>
-                    <ModelMix mix={mix} />
-                  </td>
-                  <td className="num">{formatCount(row.requests)}</td>
-                  <td className="num">{formatCompact(row.totalTokens)}</td>
-                  <td className="num">{formatCost(row.cost)}</td>
-                  <td className="num">
-                    {row.reportedCost === null ? <span className="muted">–</span> : formatCost(row.reportedCost)}
-                  </td>
-                  <td className="num">
-                    <DriftCell value={drift(row)} />
-                  </td>
-                </tr>,
-                expanded ? (
-                  <tr key={`${row.sessionId}-detail`}>
-                    <td colSpan={COLUMNS.length} style={{ background: 'var(--bg)' }}>
-                      <SessionDetail row={row} events={bySession.get(row.sessionId) ?? []} mix={mix} />
                     </td>
-                  </tr>
-                ) : null,
-              ];
-            })}
-          </tbody>
-        </table>
-      </div>
-    </section>
+                    <td style={{ whiteSpace: 'nowrap' }}>{row.project}</td>
+                    <td style={{ whiteSpace: 'nowrap' }}>{formatDateTime(row.firstTs)}</td>
+                    <td className="num">{formatDuration(row.durationMs)}</td>
+                    <td>
+                      <ModelMix mix={mix} />
+                    </td>
+                    <td className="num">{formatCount(row.requests)}</td>
+                    <td className="num">{formatCompact(row.totalTokens)}</td>
+                    <td className="num">{formatCost(row.cost)}</td>
+                    <td className="num">
+                      {row.reportedCost === null ? <span className="muted">–</span> : formatCost(row.reportedCost)}
+                    </td>
+                    <td className="num">
+                      <DriftCell value={drift(row)} />
+                    </td>
+                  </tr>,
+                  expanded ? (
+                    <tr key={`${row.sessionId}-detail`}>
+                      <td colSpan={COLUMNS.length} style={{ background: 'var(--bg)' }}>
+                        <SessionDetail row={row} events={bySession.get(row.sessionId) ?? []} mix={mix} />
+                      </td>
+                    </tr>
+                  ) : null,
+                ];
+              })}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </>
   );
 }
