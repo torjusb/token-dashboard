@@ -1,11 +1,18 @@
 import { useEffect, useState } from 'react';
-import type { ServerMessage, SessionCost, ToolCall, UsageEvent } from '../../../shared/types.ts';
+import type {
+  HumanTurn,
+  ServerMessage,
+  SessionCost,
+  ToolCall,
+  UsageEvent,
+} from '../../../shared/types.ts';
 
 export type StreamStatus = 'connecting' | 'live' | 'reconnecting' | 'error';
 
 export type LiveUsage = {
   events: UsageEvent[];
   toolCalls: ToolCall[];
+  humanTurns: HumanTurn[];
   sessionCosts: SessionCost[];
   serverNow: number;
   status: StreamStatus;
@@ -21,6 +28,8 @@ type Accumulator = {
   seen: Set<string>;
   toolCalls: ToolCall[];
   seenTools: Set<string>;
+  humanTurns: HumanTurn[];
+  seenTurns: Set<string>;
   costs: Map<string, SessionCost>;
   backfilling: boolean;
 };
@@ -31,6 +40,8 @@ function createAccumulator(): Accumulator {
     seen: new Set(),
     toolCalls: [],
     seenTools: new Set(),
+    humanTurns: [],
+    seenTurns: new Set(),
     costs: new Map(),
     backfilling: false,
   };
@@ -70,6 +81,10 @@ function insertTool(acc: Accumulator, call: ToolCall): boolean {
   return insert(acc.toolCalls, acc.seenTools, call.id, call);
 }
 
+function insertTurn(acc: Accumulator, turn: HumanTurn): boolean {
+  return insert(acc.humanTurns, acc.seenTurns, turn.id, turn);
+}
+
 function accept(acc: Accumulator, msg: ServerMessage): boolean {
   switch (msg.type) {
     case 'snapshot': {
@@ -77,19 +92,23 @@ function accept(acc: Accumulator, msg: ServerMessage): boolean {
       acc.seen.clear();
       acc.toolCalls = [];
       acc.seenTools.clear();
+      acc.humanTurns = [];
+      acc.seenTurns.clear();
       acc.costs.clear();
       acc.backfilling = msg.backfilling;
       for (const event of msg.events) insertEvent(acc, event);
       for (const call of msg.toolCalls ?? []) insertTool(acc, call);
+      for (const turn of msg.humanTurns ?? []) insertTurn(acc, turn);
       for (const cost of msg.sessionCosts) acc.costs.set(cost.sessionId, cost);
       return true;
     }
     case 'delta': {
       let changed = false;
       for (const event of msg.events) changed = insertEvent(acc, event) || changed;
-      // A server older than the tool-call grain sends no `toolCalls` at all, and one
-      // missing frame must not take the whole stream down with a TypeError.
+      // A server older than the tool-call or human-turn grain sends neither field at
+      // all, and one missing frame must not take the whole stream down with a TypeError.
       for (const call of msg.toolCalls ?? []) changed = insertTool(acc, call) || changed;
+      for (const turn of msg.humanTurns ?? []) changed = insertTurn(acc, turn) || changed;
       for (const cost of msg.sessionCosts) {
         acc.costs.set(cost.sessionId, cost);
         changed = true;
@@ -111,6 +130,7 @@ function publish(acc: Accumulator): Published {
   return {
     events: acc.events.slice(),
     toolCalls: acc.toolCalls.slice(),
+    humanTurns: acc.humanTurns.slice(),
     sessionCosts: [...acc.costs.values()],
     backfilling: acc.backfilling,
     lastEventAt: last === undefined ? null : last.ts,
