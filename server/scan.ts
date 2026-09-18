@@ -3,7 +3,7 @@ import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setImmediate as yieldToLoop } from 'node:timers/promises';
 import type { FSWatcher } from 'node:fs';
-import type { SessionCost, ToolCall, UsageEvent } from '../shared/types.ts';
+import type { HumanTurn, SessionCost, ToolCall, UsageEvent } from '../shared/types.ts';
 import { parseLine } from './parse.ts';
 import { costOf } from './pricing.ts';
 import type { Store } from './store.ts';
@@ -19,7 +19,7 @@ export type ScanOptions = {
   root: string;
   store: Store;
   windowDays: number;
-  onEvents: (events: UsageEvent[], costs: SessionCost[], toolCalls: ToolCall[]) => void;
+  onEvents: (events: UsageEvent[], costs: SessionCost[], toolCalls: ToolCall[], humanTurns: HumanTurn[]) => void;
 };
 
 export type Scanner = {
@@ -34,6 +34,7 @@ type SweepStats = {
   events: number;
   sessionCosts: number;
   toolCalls: number;
+  humanTurns: number;
   elapsedMs: number;
 };
 
@@ -87,26 +88,29 @@ export function createScanner(opts: ScanOptions): Scanner {
     return Date.now() - opts.windowDays * DAY_MS;
   }
 
-  function emit(events: UsageEvent[], costs: SessionCost[], toolCalls: ToolCall[]): void {
-    if (events.length === 0 && costs.length === 0 && toolCalls.length === 0) return;
-    opts.onEvents(events, costs, toolCalls);
+  function emit(events: UsageEvent[], costs: SessionCost[], toolCalls: ToolCall[], humanTurns: HumanTurn[]): void {
+    if (events.length === 0 && costs.length === 0 && toolCalls.length === 0 && humanTurns.length === 0) return;
+    opts.onEvents(events, costs, toolCalls, humanTurns);
   }
 
   function ingest(
     filePath: string,
     cutoff: number,
-  ): { events: UsageEvent[]; costs: SessionCost[]; toolCalls: ToolCall[] } {
+  ): { events: UsageEvent[]; costs: SessionCost[]; toolCalls: ToolCall[]; humanTurns: HumanTurn[] } {
     const prev = opts.store.getOffset(filePath);
     const tail = tailFile(filePath, prev);
 
     const events: UsageEvent[] = [];
     const costs: SessionCost[] = [];
     const toolCalls: ToolCall[] = [];
+    const humanTurns: HumanTurn[] = [];
     for (const line of tail.lines) {
       const parsed = parseLine(line, filePath);
       if (parsed === null) continue;
       if (parsed.kind === 'cost') {
         costs.push(parsed.cost);
+      } else if (parsed.kind === 'turn') {
+        if (parsed.turn.ts >= cutoff) humanTurns.push(parsed.turn);
       } else if (parsed.event.ts >= cutoff) {
         events.push({ ...parsed.event, cost: costOf(parsed.event) });
         toolCalls.push(...parsed.toolCalls);
@@ -116,6 +120,7 @@ export function createScanner(opts: ScanOptions): Scanner {
     const newEvents = opts.store.upsertEvents(events);
     const newCosts = opts.store.upsertSessionCosts(costs);
     const newToolCalls = opts.store.upsertToolCalls(toolCalls);
+    const newHumanTurns = opts.store.upsertHumanTurns(humanTurns);
 
     // Offset advances only after the rows are committed, so a crash mid-file replays
     // those lines rather than losing them; the requestId primary key absorbs the replay.
@@ -126,7 +131,7 @@ export function createScanner(opts: ScanOptions): Scanner {
       tail.mtimeMs !== prev.mtimeMs;
     if (moved) opts.store.setOffset(filePath, tail.offset, tail.size, tail.mtimeMs);
 
-    return { events: newEvents, costs: newCosts, toolCalls: newToolCalls };
+    return { events: newEvents, costs: newCosts, toolCalls: newToolCalls, humanTurns: newHumanTurns };
   }
 
   async function sweep(
@@ -148,6 +153,7 @@ export function createScanner(opts: ScanOptions): Scanner {
     let events = 0;
     let sessionCosts = 0;
     let toolCalls = 0;
+    let humanTurns = 0;
 
     async function worker(): Promise<void> {
       while (cursor < live.length && !stopped) {
@@ -159,7 +165,8 @@ export function createScanner(opts: ScanOptions): Scanner {
           events += fresh.events.length;
           sessionCosts += fresh.costs.length;
           toolCalls += fresh.toolCalls.length;
-          emit(fresh.events, fresh.costs, fresh.toolCalls);
+          humanTurns += fresh.humanTurns.length;
+          emit(fresh.events, fresh.costs, fresh.toolCalls, fresh.humanTurns);
         } catch (err) {
           console.error(`[scan] ${filePath}:`, err);
         }
@@ -178,6 +185,7 @@ export function createScanner(opts: ScanOptions): Scanner {
       events,
       sessionCosts,
       toolCalls,
+      humanTurns,
       elapsedMs: Date.now() - startedAt,
     };
   }
@@ -191,7 +199,7 @@ export function createScanner(opts: ScanOptions): Scanner {
         if (stopped) return;
         try {
           const fresh = ingest(filePath, cutoff);
-          emit(fresh.events, fresh.costs, fresh.toolCalls);
+          emit(fresh.events, fresh.costs, fresh.toolCalls, fresh.humanTurns);
         } catch (err) {
           console.error(`[scan] ${filePath}:`, err);
         }
@@ -235,8 +243,8 @@ export function createScanner(opts: ScanOptions): Scanner {
         });
         console.log(
           `[scan] backfill: ${stats.filesSeen} files seen, ${stats.filesSkippedByMtime} skipped by mtime, ` +
-            `${stats.events} events, ${stats.toolCalls} tool calls, ${stats.sessionCosts} session costs, ` +
-            `${(stats.elapsedMs / 1000).toFixed(1)}s`,
+            `${stats.events} events, ${stats.toolCalls} tool calls, ${stats.humanTurns} human turns, ` +
+            `${stats.sessionCosts} session costs, ${(stats.elapsedMs / 1000).toFixed(1)}s`,
         );
         return stats.events;
       });
@@ -258,10 +266,10 @@ export function createScanner(opts: ScanOptions): Scanner {
       rescan = setInterval(() => {
         void serialize(async () => {
           const stats = await sweep(null);
-          if (stats.events > 0 || stats.sessionCosts > 0 || stats.toolCalls > 0) {
+          if (stats.events > 0 || stats.sessionCosts > 0 || stats.toolCalls > 0 || stats.humanTurns > 0) {
             console.log(
               `[scan] rescan: ${stats.events} events, ${stats.toolCalls} tool calls, ` +
-                `${stats.sessionCosts} session costs`,
+                `${stats.humanTurns} human turns, ${stats.sessionCosts} session costs`,
             );
           }
         });

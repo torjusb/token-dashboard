@@ -20,8 +20,8 @@ const scanner = createScanner({
   root: join(homedir(), '.claude', 'projects'),
   store,
   windowDays: WINDOW_DAYS,
-  onEvents: (events, sessionCosts, toolCalls) =>
-    broadcast({ type: 'delta', serverNow: Date.now(), events, sessionCosts, toolCalls }),
+  onEvents: (events, sessionCosts, toolCalls, humanTurns) =>
+    broadcast({ type: 'delta', serverNow: Date.now(), events, sessionCosts, toolCalls, humanTurns }),
 });
 
 const api = createServer({

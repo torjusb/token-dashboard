@@ -72,6 +72,7 @@ export function createServer(opts: ServerOptions): Api {
       events,
       sessionCosts: store.allSessionCosts(),
       toolCalls: store.toolCallsSince(cutoff()),
+      humanTurns: store.humanTurnsSince(cutoff()),
       backfilling: backfilling(),
     };
   }
