@@ -1,5 +1,5 @@
 import { mcpTarget } from '../../../shared/types.ts';
-import type { SessionCost, ToolCall, UsageEvent } from '../../../shared/types.ts';
+import type { HumanTurn, SessionCost, ToolCall, UsageEvent } from '../../../shared/types.ts';
 import type { Filters } from './filters.tsx';
 
 export type Totals = {
@@ -569,6 +569,165 @@ export function sessions(
   }
   rows.sort((a, b) => b.lastTs - a.lastTs);
   return rows;
+}
+
+/** A stretch of one session's requests that ran with no human turn inside it. */
+export type Run = {
+  sessionId: string;
+  startTs: number;
+  endTs: number;
+  durationMs: number;
+  requests: number;
+  cost: number;
+  tokens: number;
+};
+
+/**
+ * Silence this long ends a run.
+ *
+ * The answer moves with this number, so it is stated rather than tuned: the longest run in
+ * the measured window is 1.52h at a 5-minute cut, 2.65h from 10 to 30 minutes, and 3.06h at
+ * 60. That is why the panel prints a run's request count beside its duration. With no cut at
+ * all the longest stretch is 84.55h over 4 requests, 84.53h of which is a single idle gap.
+ * Of the window's 16,652 inter-request gaps, 99.5% fall under 32 minutes and only 88 exceed
+ * 30, so a 30-minute cut splits abandonment rather than work.
+ *
+ * It is deliberately not the prompt-cache TTL. Every cache write in the measured window is
+ * 1-hour ephemeral, so the 5-minute TTL is not the clock this is measuring against.
+ */
+const IDLE_CUT_MS = 1_800_000;
+
+/** Index of the greatest value in `sorted` at or before `ts`, or -1 when there is none. */
+function lastAtOrBefore(sorted: readonly number[], ts: number): number {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (sorted[mid]! <= ts) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo - 1;
+}
+
+/**
+ * Every unattended run, oldest first. A run starts at the most recent human turn at or
+ * before its first request when that turn is inside the cut, otherwise at the first request
+ * itself, and ends at its last request. Runs never cross sessions.
+ *
+ * Human turns are boundary markers, not events, so they are NOT subject to the global filter
+ * bar: `events` is whatever the caller filtered, `humanTurns` is the unfiltered list. A
+ * filtered turn list would drop the boundary a person actually typed and fuse two runs into
+ * one long stretch the agent never ran alone.
+ */
+export function runs(events: readonly UsageEvent[], humanTurns: readonly HumanTurn[]): Run[] {
+  const requestsBySession = new Map<string, UsageEvent[]>();
+  for (const e of events) {
+    const list = requestsBySession.get(e.sessionId);
+    if (list === undefined) requestsBySession.set(e.sessionId, [e]);
+    else list.push(e);
+  }
+
+  const turnsBySession = new Map<string, number[]>();
+  for (const turn of humanTurns) {
+    const list = turnsBySession.get(turn.sessionId);
+    if (list === undefined) turnsBySession.set(turn.sessionId, [turn.ts]);
+    else list.push(turn.ts);
+  }
+
+  const out: Run[] = [];
+  for (const [sessionId, list] of requestsBySession) {
+    const requests = [...list].sort((a, b) => a.ts - b.ts);
+    const turns = (turnsBySession.get(sessionId) ?? []).sort((a, b) => a - b);
+
+    let startTs = 0;
+    let prev: number | null = null;
+    let count = 0;
+    let cost = 0;
+    let tokens = 0;
+
+    const emit = () => {
+      if (prev === null) return;
+      out.push({
+        sessionId,
+        startTs,
+        endTs: prev,
+        durationMs: prev - startTs,
+        requests: count,
+        cost,
+        tokens,
+      });
+    };
+
+    for (const e of requests) {
+      const at = lastAtOrBefore(turns, e.ts);
+      const latest = at < 0 ? null : turns[at]!;
+      const typedSince = latest !== null && (prev === null || latest > prev);
+      if (prev === null || e.ts - prev > IDLE_CUT_MS || typedSince) {
+        emit();
+        const opener = typedSince ? latest : null;
+        startTs = opener !== null && e.ts - opener <= IDLE_CUT_MS ? opener : e.ts;
+        count = 0;
+        cost = 0;
+        tokens = 0;
+      }
+      count += 1;
+      cost += e.cost;
+      tokens += tokensOf(e);
+      prev = e.ts;
+    }
+    emit();
+  }
+
+  out.sort((a, b) => a.startTs - b.startTs);
+  return out;
+}
+
+export type SessionStats = {
+  sessions: number;
+  meanSessionMs: number;
+  medianSessionMs: number;
+  longestSession: SessionRow | null;
+  runs: number;
+  medianRunMs: number;
+  longestRun: Run | null;
+};
+
+/**
+ * The headline numbers above the session table. Both the mean and the median are reported
+ * because they disagree by more than an order of magnitude: sessions left open for days
+ * drag the mean to 4.02h against a median of 0.17h.
+ */
+export function sessionStats(
+  events: readonly UsageEvent[],
+  sessionCosts: readonly SessionCost[],
+  humanTurns: readonly HumanTurn[],
+): SessionStats {
+  const rows = sessions(events, sessionCosts);
+  const stretches = runs(events, humanTurns);
+
+  let totalMs = 0;
+  let longestSession: SessionRow | null = null;
+  for (const row of rows) {
+    totalMs += row.durationMs;
+    if (longestSession === null || row.durationMs > longestSession.durationMs) {
+      longestSession = row;
+    }
+  }
+
+  let longestRun: Run | null = null;
+  for (const run of stretches) {
+    if (longestRun === null || run.durationMs > longestRun.durationMs) longestRun = run;
+  }
+
+  return {
+    sessions: rows.length,
+    meanSessionMs: rows.length > 0 ? totalMs / rows.length : 0,
+    medianSessionMs: median(rows.map((row) => row.durationMs)),
+    longestSession,
+    runs: stretches.length,
+    medianRunMs: median(stretches.map((run) => run.durationMs)),
+    longestRun,
+  };
 }
 
 export function burnRate(
