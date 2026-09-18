@@ -1,9 +1,10 @@
 import { EFFORTS } from '../shared/types.ts';
-import type { Effort, SessionCost, ToolCall, UsageEvent } from '../shared/types.ts';
+import type { Effort, HumanTurn, SessionCost, ToolCall, UsageEvent } from '../shared/types.ts';
 
 export type ParsedLine =
   | { kind: 'usage'; event: Omit<UsageEvent, 'cost'>; toolCalls: ToolCall[] }
-  | { kind: 'cost'; cost: SessionCost };
+  | { kind: 'cost'; cost: SessionCost }
+  | { kind: 'turn'; turn: HumanTurn };
 
 type RawUsage = {
   input_tokens?: unknown;
@@ -33,7 +34,18 @@ type RawAssistantLine = {
   message?: { id?: unknown; model?: unknown; usage?: RawUsage; content?: unknown };
 };
 
-type RawContentBlock = { type?: unknown; id?: unknown; name?: unknown };
+type RawContentBlock = { type?: unknown; id?: unknown; name?: unknown; text?: unknown };
+
+type RawUserLine = {
+  type: 'user';
+  uuid?: unknown;
+  sessionId?: unknown;
+  timestamp?: unknown;
+  isSidechain?: unknown;
+  isMeta?: unknown;
+  origin?: { kind?: unknown };
+  message?: { content?: unknown };
+};
 
 type RawCostStateLine = {
   type: 'cost-state';
@@ -130,6 +142,56 @@ function parseToolCalls(content: unknown, requestId: string, ts: number): ToolCa
   return calls;
 }
 
+const PEER_MESSAGE_PREFIX = 'Another Claude session sent a message';
+
+function hasToolResult(content: unknown): boolean {
+  if (!Array.isArray(content)) return false;
+  return (content as RawContentBlock[]).some((block) => block?.type === 'tool_result');
+}
+
+function contentText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+
+  let text = '';
+  for (const block of content as RawContentBlock[]) {
+    if (block?.type !== 'text') continue;
+    text += str(block.text) ?? '';
+  }
+  return text;
+}
+
+function parseHumanTurn(raw: RawUserLine): ParsedLine | null {
+  // Sidechain user lines are the prompts a subagent was handed, and isMeta lines are context
+  // the harness injected. Neither is a moment a person typed.
+  if (raw.isSidechain === true || raw.isMeta === true) return null;
+
+  const content = raw.message?.content;
+  if (hasToolResult(content)) return null;
+
+  if (raw.origin !== undefined && raw.origin !== null) {
+    // "task-notification" and "peer" are the agent talking to itself across sessions.
+    if (str(raw.origin.kind) !== 'human') return null;
+  } else if (contentText(content).startsWith(PEER_MESSAGE_PREFIX)) {
+    // Claude Code 2.1.266 and later label a cross-session teammate message
+    // origin.kind: "peer", but older versions journaled it with no origin at all, and there
+    // were 153 such lines in the measured 30-day window. Without this prefix check they read
+    // as human input and cut runs short.
+    return null;
+  }
+  // An absent origin stays in rather than requiring origin.kind === "human": slash commands
+  // (/clear, /compact), <bash-input> lines, [Request interrupted by user] and every prompt
+  // from Claude Code before 2.1.186 carry no origin, and all of them are real human actions.
+
+  const id = str(raw.uuid);
+  if (id === null) return null;
+
+  const ts = Date.parse(str(raw.timestamp) ?? '');
+  if (Number.isNaN(ts)) return null;
+
+  return { kind: 'turn', turn: { id, ts, sessionId: str(raw.sessionId) ?? '' } };
+}
+
 function parseCostState(raw: RawCostStateLine): ParsedLine | null {
   const sessionId = str(raw.sessionId);
   if (sessionId === null) return null;
@@ -169,5 +231,6 @@ export function parseLine(line: string, filePath: string): ParsedLine | null {
 
   if (type === 'cost-state') return parseCostState(raw as RawCostStateLine);
   if (type === 'assistant') return parseUsageEvent(raw as RawAssistantLine);
+  if (type === 'user') return parseHumanTurn(raw as RawUserLine);
   return null;
 }
