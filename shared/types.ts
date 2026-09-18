@@ -98,6 +98,23 @@ export function mcpTarget(name: string): { server: string; tool: string } | null
   return { server: rest.slice(0, split), tool: rest.slice(split + 2) };
 }
 
+/**
+ * One moment a person typed into a session, at the transcript-line grain.
+ *
+ * Neither `UsageEvent` nor `ToolCall` records when a human acted, so nothing else can tell a
+ * stretch the person was driving from a stretch the agent ran alone. These are the boundary
+ * markers that split a session into runs.
+ *
+ * Attribution is absent for the same reason it is on `ToolCall`: the browser already holds
+ * every `UsageEvent`, so project, model and cost come from joining to the session's requests.
+ */
+export type HumanTurn = {
+  /** Transcript line `uuid`. Dedupe key and the store's primary key. */
+  id: string;
+  ts: number;
+  sessionId: string;
+};
+
 /** Claude Code's own per-session cost accounting, used to validate `cost`. */
 export type SessionCost = {
   sessionId: string;
@@ -122,6 +139,8 @@ export type Snapshot = {
   sessionCosts: SessionCost[];
   /** Ordered oldest-first, and only for requests inside `events`. */
   toolCalls: ToolCall[];
+  /** Ordered oldest-first, over the same window as `events`. */
+  humanTurns: HumanTurn[];
   /** True while the initial 30-day backfill is still running. */
   backfilling: boolean;
 };
@@ -133,6 +152,7 @@ export type Delta = {
   events: UsageEvent[];
   sessionCosts: SessionCost[];
   toolCalls: ToolCall[];
+  humanTurns: HumanTurn[];
 };
 
 /** Keeps the connection warm and the freshness clock accurate when idle. */
