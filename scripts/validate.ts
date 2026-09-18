@@ -431,6 +431,172 @@ async function checkAttribution(cutoff: number): Promise<CheckResult> {
 }
 
 /**
+ * Every raw user line inside the window, decoded but otherwise untouched. It exists for the
+ * same reason rawAssistantLines does: a human-turn count that went through server/parse.ts
+ * could only restate the parser, never catch it.
+ */
+async function* rawUserLines(
+  cutoff: number,
+): AsyncGenerator<{ rec: Record<string, unknown>; ts: number }> {
+  for (const file of await walkJsonlFiles(TRANSCRIPTS_ROOT)) {
+    try {
+      if (statSync(file).mtimeMs < cutoff) continue;
+    } catch {
+      continue;
+    }
+
+    let text: string;
+    try {
+      text = readFileSync(file, 'utf8');
+    } catch {
+      continue;
+    }
+
+    for (const line of text.split('\n')) {
+      if (!line.includes('"type":"user"')) continue;
+      let raw: unknown;
+      try {
+        raw = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (typeof raw !== 'object' || raw === null) continue;
+      const rec = raw as Record<string, unknown>;
+      if (rec.type !== 'user') continue;
+
+      const ts = Date.parse(typeof rec.timestamp === 'string' ? rec.timestamp : '');
+      if (Number.isNaN(ts) || ts < cutoff) continue;
+
+      yield { rec, ts };
+    }
+  }
+}
+
+const TEAMMATE_MESSAGE_PREFIX = 'Another Claude session sent a message';
+
+function userLineText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  let text = '';
+  for (const block of content as Array<Record<string, unknown>>) {
+    if (block?.type === 'text' && typeof block.text === 'string') text += block.text;
+  }
+  return text;
+}
+
+/**
+ * A second opinion on which user lines a person actually typed. Most of them are not: tool
+ * results come back as user lines, subagent prompts carry isSidechain, injected context
+ * carries isMeta, and a message from another Claude session is a user line too.
+ *
+ * A line with no `origin` field at all still counts, because slash commands, bash input and
+ * every prompt from Claude Code before 2.1.186 carry none. That leniency is what makes the
+ * teammate-prefix test load-bearing, so this counts the lines it rejects rather than
+ * dropping them silently: if that number goes to zero the rule has stopped catching them.
+ */
+async function independentHumanTurnCount(cutoff: number): Promise<{
+  turns: number;
+  sessions: number;
+  teammateLinesWithNoOrigin: number;
+}> {
+  const ids = new Set<string>();
+  const sessions = new Set<string>();
+  let teammateLinesWithNoOrigin = 0;
+
+  for await (const { rec } of rawUserLines(cutoff)) {
+    if (rec.isSidechain === true || rec.isMeta === true) continue;
+
+    const message = rec.message as Record<string, unknown> | undefined;
+    const content = message?.content;
+    if (
+      Array.isArray(content) &&
+      (content as Array<Record<string, unknown>>).some((block) => block?.type === 'tool_result')
+    ) {
+      continue;
+    }
+
+    const origin = rec.origin as Record<string, unknown> | null | undefined;
+    if (origin !== undefined && origin !== null) {
+      if (origin.kind !== 'human') continue;
+    } else if (userLineText(content).startsWith(TEAMMATE_MESSAGE_PREFIX)) {
+      teammateLinesWithNoOrigin++;
+      continue;
+    }
+
+    const id = rec.uuid;
+    if (typeof id !== 'string' || id.length === 0) continue;
+    ids.add(id);
+    if (typeof rec.sessionId === 'string') sessions.add(rec.sessionId);
+  }
+
+  return { turns: ids.size, sessions: sessions.size, teammateLinesWithNoOrigin };
+}
+
+/**
+ * Silence this long ends a run. The panel cuts on IDLE_CUT_MS in web/src/lib/select.ts; this
+ * copy is restated rather than imported, so the validator stays a second opinion written
+ * against the raw data instead of a mirror of the code it is checking.
+ */
+const IDLE_CUT_MS = 1_800_000;
+
+/**
+ * The share of inter-request gaps allowed to run past the cut.
+ *
+ * The longest run is only a readable number while the cut sits in the tail of the gap
+ * distribution: a cut the body of the distribution crosses would be slicing work rather than
+ * abandonment, and the answer would be an artefact of the constant. Working habits drift, so
+ * this is asserted rather than assumed.
+ */
+const GAPS_OVER_CUT_LIMIT = 0.01;
+
+async function checkRuns(store: Store, cutoff: number): Promise<CheckResult> {
+  const raw = await independentHumanTurnCount(cutoff);
+  const storeCount = store.countHumanTurns();
+  const error = pct(storeCount, raw.turns);
+
+  const timesBySession = new Map<string, number[]>();
+  for (const e of store.eventsSince(0)) {
+    const list = timesBySession.get(e.sessionId);
+    if (list === undefined) timesBySession.set(e.sessionId, [e.ts]);
+    else list.push(e.ts);
+  }
+
+  const gaps: number[] = [];
+  for (const times of timesBySession.values()) {
+    times.sort((a, b) => a - b);
+    for (let i = 1; i < times.length; i++) gaps.push(times[i]! - times[i - 1]!);
+  }
+  gaps.sort((a, b) => a - b);
+
+  const minutes = (ms: number): string => (ms / 60_000).toFixed(2);
+  const at = (p: number): number =>
+    gaps.length === 0 ? 0 : gaps[Math.min(gaps.length - 1, Math.floor(p * gaps.length))]!;
+  const overCut = gaps.filter((g) => g > IDLE_CUT_MS).length;
+  const share = gaps.length === 0 ? 1 : overCut / gaps.length;
+
+  const turnSessions = new Set(store.humanTurnsSince(0).map((t) => t.sessionId));
+  const noTurn = [...timesBySession.keys()].filter((id) => !turnSessions.has(id));
+
+  const pass = raw.turns > 0 && error <= 0.5 && gaps.length > 0 && share < GAPS_OVER_CUT_LIMIT;
+
+  return {
+    name: 'RUNS',
+    pass,
+    lines: [
+      `independent human turns: ${raw.turns} across ${raw.sessions} sessions`,
+      `store countHumanTurns(): ${storeCount}`,
+      `error vs independent count: ${error.toFixed(3)}% (fail above 0.5%)`,
+      `teammate messages with no origin field, held out by the text check: ${raw.teammateLinesWithNoOrigin}`,
+      `sessions with requests but no human turn: ${noTurn.length} of ${timesBySession.size}`,
+      `inter-request gaps: ${gaps.length}, median ${minutes(at(0.5))} min, ` +
+        `p99 ${minutes(at(0.99))} min, p99.5 ${minutes(at(0.995))} min`,
+      `gaps past the ${IDLE_CUT_MS / 60_000}-minute cut: ${overCut} ` +
+        `(${(share * 100).toFixed(3)}%, fail at or above ${(GAPS_OVER_CUT_LIMIT * 100).toFixed(0)}%)`,
+    ],
+  };
+}
+
+/**
  * Claude Code may be running on this machine while the validator runs, so a genuinely new
  * request can land between the two counts. Re-ingesting a request the store already held is
  * the real failure; an arrival stamped after the check began is not. The grace window covers
@@ -570,6 +736,7 @@ async function main(): Promise<void> {
     results.push(checkInvariants(store, cutoff));
     results.push(await checkToolCalls(store, cutoff));
     results.push(await checkAttribution(cutoff));
+    results.push(await checkRuns(store, cutoff));
     results.push(await checkPricing());
     results.push(await checkCoverage(store));
     results.push(await checkIdempotency(store));
