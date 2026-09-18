@@ -24,8 +24,7 @@ of transcript history, then updates live as new requests land, with no page refr
 | `attributionMcpServer` / `attributionMcpTool` disagree with the block on their own line | 203 claude-in-chrome calls with a null server; tool field names a different tool 60+ times per pair |
 | Human input reaches the transcript only on `type:"user"` lines, and only some of those are people | 791 turns over 30d; 4 of the 285 sessions with requests have none, and the largest of those four holds 7 requests |
 | Claude Code labels cross-session teammate messages `origin.kind:"peer"` only from 2.1.266 | 155 lines in the window are teammate messages with no `origin` field at all |
-| Inter-request gaps cluster far below half an hour | 31,428 gaps over 30d, 99.5% under 15 min, only 79 over 30 min |
-| Every cache write in the window is 1-hour ephemeral | 100% of `cache_creation` tokens, so the 5-minute TTL is not a clock anything here can use |
+| Inter-request gaps cluster far below a quarter of an hour | 31,538 gaps over 30d, p99 4.56 min and p99.5 14.42 min, only 152 over 15 min |
 
 Consequences: **dedupe by `requestId` or every metric doubles.** `thinking` is a subset of
 `output`, so never add it into a token total. Cache reads dominate volume by ~40x, so any
@@ -107,9 +106,9 @@ model mix. Drill into one session's request timeline. A live feed of recent requ
 **Session length and unattended runs.** Four tiles above that table: sessions in the window,
 median session length with the mean beside it, the longest session, and the longest run without
 human input. `runs()` in `select.ts` cuts each session into runs and `sessionStats()` reduces
-both shapes to the tile figures. The median leads because the mean is 3.99h against a median of
-0.17h; sessions left open for days drag it. The longest run shows its request count beside its
-duration, because the duration moves with the idle cut and the count is what makes it readable.
+both shapes to the tile figures. The median leads because the mean is 4h against a median of 10
+minutes; sessions left open for days drag it. The longest run shows its request count beside
+its duration, because the count is what tells a dense run from a sparse one of the same length.
 
 Human turns are boundary markers, not events, so they are the one record the global filter bar
 does not touch. Runs are computed over whatever filtered events the panel holds, bounded by the
@@ -158,9 +157,9 @@ testing one thing:
    values. The whole per-skill cost number rests on that, so it is asserted rather than assumed.
 8. **RUNS.** Store count matches an independent recount of human turns, written against the raw
    format rather than calling `parse.ts`, so it can catch a parser bug instead of restating one.
-   Then the share of inter-request gaps running past the 30-minute cut must stay under 1%,
+   Then the share of inter-request gaps running past the 15-minute cut must stay under 1%,
    because the longest run is only meaningful while the cut sits in the tail of the gap
-   distribution rather than through its body. It is 0.25% today. Working habits drift; the
+   distribution rather than through its body. It is 0.48% today. Working habits drift; the
    constant would otherwise rot unnoticed.
 
 ## What the measurements turned up
@@ -207,15 +206,17 @@ but 155 lines in the window predate it and carry no `origin`, so without a check
 The rule finds 791 turns. Of the 285 sessions holding requests, 4 have no turn at all, and the
 largest of those four is 7 requests, so they read as work someone else's session kicked off.
 
-**A run needs an idle cut, and the answer moves with it.** Without one, the longest run without
-human input is 84.55 hours, of which 84.53 hours is a single idle gap, and the whole stretch
-holds 4 requests. That is a laptop left open, not a run. The cut is 30 minutes: of the window's
-31,428 inter-request gaps, 99.5% are under 15 minutes and only 79 exceed 30, so it splits
-abandonment rather than work. The longest run is 3.21h at a 5- or 10-minute cut and 7.82h from
-30 minutes out to an hour, which is why the panel shows the run's request count beside its
-duration rather than the duration alone. The obvious anchor is the prompt-cache TTL, and it is
-the wrong one: 100% of cache writes in the window are 1-hour ephemeral, so the 5-minute TTL
-measures nothing here.
+**A run needs an idle cut, and the sweep is a plateau with a cliff.** Without a cut the longest
+run without human input is 84.55 hours, of which 84.53 hours is a single idle gap, and the
+whole stretch holds 4 requests. That is a laptop left open, not a run. Sweeping the cut does
+not trade the answer off smoothly against it: the longest run is the same 3.21h over 729
+requests everywhere from 5 minutes to 17, then flips to 3.47h over 25 requests at 18, 5.02h
+over 39 at 20, and 7.82h over 606 at 30. Those later winners are sparse stretches padded by
+idle time, 8 requests an hour against 227 inside the plateau. So the constant decides nothing
+anywhere inside the plateau, and that is the argument for the 15 minutes the code uses: inside
+it, with room before the cliff, and just past the p99.5 inter-request gap of 14.42 minutes.
+The panel shows the run's request count beside its duration because the count is the only
+thing on the tile that tells a plateau winner from a cliff winner.
 
 **Cost is a lower bound, by about 7%.** The transcripts hold 98% of billed cache reads but only
 60% of billed output tokens and 3% of billed fresh input, because Claude Code bills internal

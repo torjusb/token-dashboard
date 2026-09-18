@@ -64,14 +64,16 @@ sessions left open overnight drag the average, and the median is the one that de
 working day. And the longest run without human input, meaning the longest stretch of requests
 with no turn of yours inside it.
 
-A run also ends after 30 minutes of silence. Without that cut the longest "unattended run" is
+A run also ends after 15 minutes of silence. Without that cut the longest "unattended run" is
 three and a half days, almost all of it one idle gap around four requests, which measures a
-laptop left open rather than an agent working. Of 31,428 gaps between consecutive requests in a
-window, only 79 run past 30 minutes, so the cut lands in the tail rather than through the
-middle of anything. The answer does move with it, from 3.2h at a 5-minute cut to 7.8h at half
-an hour, which is why the tile shows the run's request count next to its duration.
-`npm run validate` asserts that under 1% of gaps run past the cut, so the number cannot rot
-quietly as habits change.
+laptop left open rather than an agent working. Fifteen minutes is not a tuned number: sweeping
+the cut gives the same answer, 3.2h over 729 requests, everywhere from 5 minutes to 17, and
+only past that does the winner change, to 25 requests over 3.5h at 18 minutes and 39 over 5h
+at 20. Those are stretches padded out by idle time, 8 requests an hour where the plateau
+winner runs 227, and that is why the tile shows a run's request count next to its duration.
+Of 31,538 gaps between consecutive requests in a window, 152 run past 15 minutes, so the cut
+lands in the tail rather than through the middle of anything. `npm run validate` asserts that
+under 1% of gaps run past it, so the number cannot rot quietly as habits change.
 
 ## Cost is a lower bound
 
@@ -98,7 +100,7 @@ npm run validate
 own independent reader, compares derived cost against the `totalCostUSD` Claude Code records for
 each session, re-runs the backfill to prove ingest is idempotent, asserts the per-event
 invariants, proves no request carries two different skill attributions, since the per-skill cost
-figures rest on that, and checks that the 30-minute idle cut still sits in the tail of the gap
+figures rest on that, and checks that the 15-minute idle cut still sits in the tail of the gap
 distribution. It exits non-zero on failure, so it is the thing to run after any change to the
 ingest path rather than trusting the dashboard to look plausible.
 

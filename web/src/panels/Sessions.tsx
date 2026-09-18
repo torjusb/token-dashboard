@@ -272,7 +272,7 @@ function StatTiles({ stats, rows }: { stats: SessionStats; rows: readonly Sessio
             ? 'no runs'
             : `${formatCount(run.requests)} requests · ${projects.get(run.sessionId) ?? 'unknown project'}`
         }
-        hint="The longest stretch of requests with no human turn inside it. Thirty minutes of silence ends a run, and the answer moves with that cut, so the request count is what says whether the stretch was work or waiting."
+        hint="The longest stretch of requests with no human turn inside it. Fifteen minutes of silence ends a run. The request count beside the duration is what separates an agent working from a sparse stretch padded out by idle time."
       />
     </div>
   );

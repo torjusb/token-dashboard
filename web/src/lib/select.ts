@@ -585,17 +585,19 @@ export type Run = {
 /**
  * Silence this long ends a run.
  *
- * The answer moves with this number, so it is stated rather than tuned: the longest run in
- * the measured window is 3.21h at a 5- or 10-minute cut and 7.82h from 30 minutes out to an
- * hour. That is why the panel prints a run's request count beside its duration. With no cut
- * at all the longest stretch is 84.55h over 4 requests, 84.53h of which is a single idle gap.
- * Of the window's 31,428 inter-request gaps only 79 exceed 30 minutes, a quarter of one
- * percent, so a 30-minute cut splits abandonment rather than work.
+ * Swept over the measured window the answer is a plateau and then a cliff, not a curve. The
+ * longest run is the same 3.21h over 729 requests everywhere from 5 minutes to 17, so
+ * anywhere inside that plateau the exact number decides nothing. At 18 minutes the winner
+ * flips to 3.47h over 25 requests, at 20 to 5.02h over 39, and at 30 to 7.82h over 606, every
+ * one of them padded by the idle time the cut exists to remove. 15 sits inside the plateau
+ * with room before the cliff, just past the p99.5 inter-request gap of 14.42 minutes. With no cut
+ * at all the longest stretch is 84.55h over 4 requests, 84.53h of which is one idle gap.
  *
- * It is deliberately not the prompt-cache TTL. Every cache write in the measured window is
- * 1-hour ephemeral, so the 5-minute TTL is not the clock this is measuring against.
+ * The cliff is why the panel prints a run's request count beside its duration. 729 requests
+ * in 3.21h is 227 an hour and reads as an agent working; 39 in 5.02h is 8 an hour and does
+ * not, though nothing in the duration alone tells them apart.
  */
-const IDLE_CUT_MS = 1_800_000;
+const IDLE_CUT_MS = 900_000;
 
 /** Index of the greatest value in `sorted` at or before `ts`, or -1 when there is none. */
 function lastAtOrBefore(sorted: readonly number[], ts: number): number {
@@ -695,7 +697,7 @@ export type SessionStats = {
 /**
  * The headline numbers above the session table. Both the mean and the median are reported
  * because they disagree by more than an order of magnitude: sessions left open for days
- * drag the mean to 3.99h against a median of 0.17h.
+ * drag the mean to 4h against a median of 10 minutes.
  */
 export function sessionStats(
   events: readonly UsageEvent[],

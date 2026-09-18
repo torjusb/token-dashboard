@@ -537,7 +537,7 @@ async function independentHumanTurnCount(cutoff: number): Promise<{
  * copy is restated rather than imported, so the validator stays a second opinion written
  * against the raw data instead of a mirror of the code it is checking.
  */
-const IDLE_CUT_MS = 1_800_000;
+const IDLE_CUT_MS = 900_000;
 
 /**
  * The share of inter-request gaps allowed to run past the cut.
