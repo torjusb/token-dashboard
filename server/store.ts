@@ -2,19 +2,22 @@ import { DatabaseSync } from 'node:sqlite';
 import type { SQLInputValue } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { UsageEvent, SessionCost, ToolCall, Effort } from '../shared/types.ts';
+import type { UsageEvent, SessionCost, ToolCall, HumanTurn, Effort } from '../shared/types.ts';
 
 export type Store = {
   upsertEvents(events: UsageEvent[]): UsageEvent[];
   upsertSessionCosts(costs: SessionCost[]): SessionCost[];
   upsertToolCalls(calls: ToolCall[]): ToolCall[];
+  upsertHumanTurns(turns: HumanTurn[]): HumanTurn[];
   eventsSince(tsMs: number): UsageEvent[];
   allSessionCosts(): SessionCost[];
   toolCallsSince(tsMs: number): ToolCall[];
+  humanTurnsSince(tsMs: number): HumanTurn[];
   getOffset(filePath: string): { offset: number; size: number; mtimeMs: number } | null;
   setOffset(filePath: string, offset: number, size: number, mtimeMs: number): void;
   countEvents(): number;
   countToolCalls(): number;
+  countHumanTurns(): number;
   pruneBefore(tsMs: number): number;
   close(): void;
 };
@@ -70,8 +73,15 @@ const TOOL_CALL_BINDINGS: Bindings<ToolCall> = {
   name: (c) => c.name,
 };
 
+const HUMAN_TURN_BINDINGS: Bindings<HumanTurn> = {
+  id: (t) => t.id,
+  ts: (t) => t.ts,
+  sessionId: (t) => t.sessionId,
+};
+
 const EVENT_COLUMNS = columnsOf(EVENT_BINDINGS);
 const TOOL_CALL_COLUMNS = columnsOf(TOOL_CALL_BINDINGS);
+const HUMAN_TURN_COLUMNS = columnsOf(HUMAN_TURN_BINDINGS);
 
 type EventRow = {
   requestId: string;
@@ -116,6 +126,12 @@ type ToolCallRow = {
   requestId: string;
   ts: number;
   name: string;
+};
+
+type HumanTurnRow = {
+  id: string;
+  ts: number;
+  sessionId: string;
 };
 
 function rowToEvent(row: EventRow): UsageEvent {
@@ -185,10 +201,11 @@ function rebuildIfStale(db: DatabaseSync): void {
 
   const stale: string[] = EVENT_COLUMNS.filter((column) => !columns.includes(column));
   if (!tableExists(db, 'tool_calls')) stale.push('tool_calls');
+  if (!tableExists(db, 'human_turns')) stale.push('human_turns');
   if (stale.length === 0) return;
 
   console.log(`[store] schema predates ${stale.join(', ')}; rebuilding from the transcripts`);
-  for (const table of ['events', 'tool_calls', 'offsets']) db.exec(`DROP TABLE IF EXISTS ${table}`);
+  for (const table of ['events', 'tool_calls', 'human_turns', 'offsets']) db.exec(`DROP TABLE IF EXISTS ${table}`);
 }
 
 export function openStore(dbPath: string): Store {
@@ -255,6 +272,15 @@ export function openStore(dbPath: string): Store {
   db.exec('CREATE INDEX IF NOT EXISTS idx_tool_calls_ts ON tool_calls(ts)');
 
   db.exec(`
+    CREATE TABLE IF NOT EXISTS human_turns (
+      id TEXT PRIMARY KEY,
+      ts INTEGER NOT NULL,
+      sessionId TEXT NOT NULL
+    )
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_human_turns_ts ON human_turns(ts)');
+
+  db.exec(`
     CREATE TABLE IF NOT EXISTS offsets (
       filePath TEXT PRIMARY KEY,
       offset INTEGER NOT NULL,
@@ -290,8 +316,15 @@ export function openStore(dbPath: string): Store {
     ON CONFLICT(id) DO NOTHING
   `);
 
+  const insertHumanTurn = db.prepare(`
+    INSERT INTO human_turns (${HUMAN_TURN_COLUMNS.join(', ')})
+    VALUES (${HUMAN_TURN_COLUMNS.map(() => '?').join(', ')})
+    ON CONFLICT(id) DO NOTHING
+  `);
+
   const selectEventsSince = db.prepare('SELECT * FROM events WHERE ts >= ? ORDER BY ts ASC');
   const selectToolCallsSince = db.prepare('SELECT * FROM tool_calls WHERE ts >= ? ORDER BY ts ASC');
+  const selectHumanTurnsSince = db.prepare('SELECT * FROM human_turns WHERE ts >= ? ORDER BY ts ASC');
   const selectAllSessionCosts = db.prepare('SELECT * FROM session_costs');
   const selectOffset = db.prepare('SELECT offset, size, mtimeMs FROM offsets WHERE filePath = ?');
   const upsertOffset = db.prepare(`
@@ -300,8 +333,10 @@ export function openStore(dbPath: string): Store {
   `);
   const selectCount = db.prepare('SELECT COUNT(*) AS c FROM events');
   const selectToolCallCount = db.prepare('SELECT COUNT(*) AS c FROM tool_calls');
+  const selectHumanTurnCount = db.prepare('SELECT COUNT(*) AS c FROM human_turns');
   const deleteBefore = db.prepare('DELETE FROM events WHERE ts < ?');
   const deleteToolCallsBefore = db.prepare('DELETE FROM tool_calls WHERE ts < ?');
+  const deleteHumanTurnsBefore = db.prepare('DELETE FROM human_turns WHERE ts < ?');
 
   function upsertEvents(events: UsageEvent[]): UsageEvent[] {
     const inserted: UsageEvent[] = [];
@@ -328,6 +363,23 @@ export function openStore(dbPath: string): Store {
       for (const c of calls) {
         const result = insertToolCall.run(...bind(TOOL_CALL_BINDINGS, TOOL_CALL_COLUMNS, c));
         if (Number(result.changes) > 0) inserted.push(c);
+      }
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+    return inserted;
+  }
+
+  function upsertHumanTurns(turns: HumanTurn[]): HumanTurn[] {
+    const inserted: HumanTurn[] = [];
+    if (turns.length === 0) return inserted;
+    db.exec('BEGIN');
+    try {
+      for (const t of turns) {
+        const result = insertHumanTurn.run(...bind(HUMAN_TURN_BINDINGS, HUMAN_TURN_COLUMNS, t));
+        if (Number(result.changes) > 0) inserted.push(t);
       }
       db.exec('COMMIT');
     } catch (err) {
@@ -372,6 +424,7 @@ export function openStore(dbPath: string): Store {
     upsertEvents,
     upsertSessionCosts,
     upsertToolCalls,
+    upsertHumanTurns,
     eventsSince(tsMs: number): UsageEvent[] {
       return (selectEventsSince.all(tsMs) as EventRow[]).map(rowToEvent);
     },
@@ -380,6 +433,9 @@ export function openStore(dbPath: string): Store {
     },
     toolCallsSince(tsMs: number): ToolCall[] {
       return selectToolCallsSince.all(tsMs) as ToolCallRow[];
+    },
+    humanTurnsSince(tsMs: number): HumanTurn[] {
+      return selectHumanTurnsSince.all(tsMs) as HumanTurnRow[];
     },
     getOffset(filePath: string) {
       const row = selectOffset.get(filePath) as { offset: number; size: number; mtimeMs: number } | undefined;
@@ -396,9 +452,14 @@ export function openStore(dbPath: string): Store {
       const row = selectToolCallCount.get() as { c: number };
       return row.c;
     },
+    countHumanTurns(): number {
+      const row = selectHumanTurnCount.get() as { c: number };
+      return row.c;
+    },
     pruneBefore(tsMs: number): number {
       const result = deleteBefore.run(tsMs);
       deleteToolCallsBefore.run(tsMs);
+      deleteHumanTurnsBefore.run(tsMs);
       // Callers report this as an event count, so the tool-call rows are not added in.
       return Number(result.changes);
     },
