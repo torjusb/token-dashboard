@@ -586,11 +586,11 @@ export type Run = {
  * Silence this long ends a run.
  *
  * The answer moves with this number, so it is stated rather than tuned: the longest run in
- * the measured window is 1.52h at a 5-minute cut, 2.65h from 10 to 30 minutes, and 3.06h at
- * 60. That is why the panel prints a run's request count beside its duration. With no cut at
- * all the longest stretch is 84.55h over 4 requests, 84.53h of which is a single idle gap.
- * Of the window's 16,652 inter-request gaps, 99.5% fall under 32 minutes and only 88 exceed
- * 30, so a 30-minute cut splits abandonment rather than work.
+ * the measured window is 3.21h at a 5- or 10-minute cut and 7.82h from 30 minutes out to an
+ * hour. That is why the panel prints a run's request count beside its duration. With no cut
+ * at all the longest stretch is 84.55h over 4 requests, 84.53h of which is a single idle gap.
+ * Of the window's 31,428 inter-request gaps only 79 exceed 30 minutes, a quarter of one
+ * percent, so a 30-minute cut splits abandonment rather than work.
  *
  * It is deliberately not the prompt-cache TTL. Every cache write in the measured window is
  * 1-hour ephemeral, so the 5-minute TTL is not the clock this is measuring against.
@@ -695,7 +695,7 @@ export type SessionStats = {
 /**
  * The headline numbers above the session table. Both the mean and the median are reported
  * because they disagree by more than an order of magnitude: sessions left open for days
- * drag the mean to 4.02h against a median of 0.17h.
+ * drag the mean to 3.99h against a median of 0.17h.
  */
 export function sessionStats(
   events: readonly UsageEvent[],

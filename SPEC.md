@@ -22,6 +22,10 @@ of transcript history, then updates live as new requests land, with no page refr
 | A request issues 1 to 13 `tool_use` blocks | 21,513 distinct ids over 19,335 requests |
 | One transcript is reachable by two paths, a symlink beside its real file | 165 tool-use ids repeat under session resume once the symlink is excluded, 243 if it is not |
 | `attributionMcpServer` / `attributionMcpTool` disagree with the block on their own line | 203 claude-in-chrome calls with a null server; tool field names a different tool 60+ times per pair |
+| Human input reaches the transcript only on `type:"user"` lines, and only some of those are people | 791 turns over 30d; 4 of the 285 sessions with requests have none, and the largest of those four holds 7 requests |
+| Claude Code labels cross-session teammate messages `origin.kind:"peer"` only from 2.1.266 | 155 lines in the window are teammate messages with no `origin` field at all |
+| Inter-request gaps cluster far below half an hour | 31,428 gaps over 30d, 99.5% under 15 min, only 79 over 30 min |
+| Every cache write in the window is 1-hour ephemeral | 100% of `cache_creation` tokens, so the 5-minute TTL is not a clock anything here can use |
 
 Consequences: **dedupe by `requestId` or every metric doubles.** `thinking` is a subset of
 `output`, so never add it into a token total. Cache reads dominate volume by ~40x, so any
@@ -64,7 +68,7 @@ in someone else's file, report it instead.
 
 | # | File | Job |
 | --- | --- | --- |
-| B1 | `server/parse.ts` | One transcript line → `UsageEvent` + its `ToolCall`s, `SessionCost`, or nothing |
+| B1 | `server/parse.ts` | One transcript line → `UsageEvent` + its `ToolCall`s, `SessionCost`, `HumanTurn`, or nothing |
 | B2 | `server/pricing.ts` | Per-model token pricing, `costOf(event)` |
 | B3 | `server/store.ts` | SQLite schema, idempotent upsert, snapshot reads, tail offsets |
 | B4 | `server/tail.ts` | Byte-offset incremental file reads, partial trailing lines |
@@ -77,7 +81,7 @@ in someone else's file, report it instead.
 | F5 | `web/src/panels/overview.tsx` | Live tiles, burn rate, today vs 30d trend |
 | F6 | `web/src/panels/breakdown.tsx` | Model / project / subagent / effort breakdowns |
 | F7 | `web/src/panels/cache.tsx` | Cache efficiency, 5m vs 1h, savings |
-| F8 | `web/src/panels/sessions.tsx` | Session table + drill-down, live feed |
+| F8 | `web/src/panels/sessions.tsx` | Session-length and unattended-run tiles, session table + drill-down, live feed |
 | F9 | `web/src/App.tsx` + global filter bar | Layout, filters, routing between panels |
 | F10 | `web/src/panels/Skills.tsx` | Skill / plugin / tool / MCP-server breakdowns |
 
@@ -100,6 +104,17 @@ ephemeral split, and what the cache saved against uncached pricing.
 **Sessions.** A sortable table keyed by session: `slug`, project, duration, tokens, cost,
 model mix. Drill into one session's request timeline. A live feed of recent requests.
 
+**Session length and unattended runs.** Four tiles above that table: sessions in the window,
+median session length with the mean beside it, the longest session, and the longest run without
+human input. `runs()` in `select.ts` cuts each session into runs and `sessionStats()` reduces
+both shapes to the tile figures. The median leads because the mean is 3.99h against a median of
+0.17h; sessions left open for days drag it. The longest run shows its request count beside its
+duration, because the duration moves with the idle cut and the count is what makes it readable.
+
+Human turns are boundary markers, not events, so they are the one record the global filter bar
+does not touch. Runs are computed over whatever filtered events the panel holds, bounded by the
+unfiltered turns. Filtering the boundaries would silently merge two runs into one.
+
 **Rhythm.** A day-by-hour heatmap of token volume, and thinking tokens as a share of output.
 
 **Skills and tools.** What each skill costs, ranked by cost with its main-thread versus
@@ -118,7 +133,7 @@ the `requestId` join: a tool call counts only when its request survives the filt
 
 ## Correctness bar
 
-`scripts/validate.ts` must pass. It is the lever that proves the pipeline. Seven checks, each
+`scripts/validate.ts` must pass. It is the lever that proves the pipeline. Eight checks, each
 testing one thing:
 
 1. **DEDUPE.** Store count matches an independent recount of distinct `requestId`s, written
@@ -141,10 +156,16 @@ testing one thing:
    stored tool call's `requestId` resolves to an event, because the client join depends on it.
 7. **ATTRIBUTION.** No `requestId` in the window carries two distinct `attributionSkill`
    values. The whole per-skill cost number rests on that, so it is asserted rather than assumed.
+8. **RUNS.** Store count matches an independent recount of human turns, written against the raw
+   format rather than calling `parse.ts`, so it can catch a parser bug instead of restating one.
+   Then the share of inter-request gaps running past the 30-minute cut must stay under 1%,
+   because the longest run is only meaningful while the cut sits in the tail of the gap
+   distribution rather than through its body. It is 0.25% today. Working habits drift; the
+   constant would otherwise rot unnoticed.
 
 ## What the measurements turned up
 
-Three findings that changed the design, all reproducible through the validator:
+The findings that changed the design, all reproducible through the validator:
 
 **The transcript walk must not follow symlinks.** One subagent transcript under
 `rema-1000-prefetch` exists as a symlink in one session directory pointing at the real file in
@@ -172,6 +193,29 @@ a different tool than the block on the same line more than 60 times per pair, `c
 `navigate` being the commonest. They behave like markers for the newest MCP result in context,
 not a record of what the line invoked. Splitting the `mcp__<server>__<tool>` name is exact, so
 that is what `mcpTarget()` does, and the fields are ingested nowhere.
+
+**Most `type:"user"` lines were not typed by a person.** Tool results come back as user lines,
+subagent prompts are user lines with `isSidechain`, injected context is a user line with
+`isMeta`, and a message from another Claude session is a user line too. A human turn is what
+survives dropping all four, plus an `origin.kind` of `"task-notification"` or `"peer"`. Lines
+with no `origin` at all stay in, because slash commands like `/clear` and `/compact`,
+`<bash-input>` lines, `[Request interrupted by user]` and every prompt from Claude Code before
+2.1.186 carry none, and all of them are real human actions. That leniency is what makes the
+teammate-message text check load-bearing: 2.1.266 and later label those `origin.kind:"peer"`,
+but 155 lines in the window predate it and carry no `origin`, so without a check on the
+`Another Claude session sent a message` prefix they read as human input and cut runs short.
+The rule finds 791 turns. Of the 285 sessions holding requests, 4 have no turn at all, and the
+largest of those four is 7 requests, so they read as work someone else's session kicked off.
+
+**A run needs an idle cut, and the answer moves with it.** Without one, the longest run without
+human input is 84.55 hours, of which 84.53 hours is a single idle gap, and the whole stretch
+holds 4 requests. That is a laptop left open, not a run. The cut is 30 minutes: of the window's
+31,428 inter-request gaps, 99.5% are under 15 minutes and only 79 exceed 30, so it splits
+abandonment rather than work. The longest run is 3.21h at a 5- or 10-minute cut and 7.82h from
+30 minutes out to an hour, which is why the panel shows the run's request count beside its
+duration rather than the duration alone. The obvious anchor is the prompt-cache TTL, and it is
+the wrong one: 100% of cache writes in the window are 1-hour ephemeral, so the 5-minute TTL
+measures nothing here.
 
 **Cost is a lower bound, by about 7%.** The transcripts hold 98% of billed cache reads but only
 60% of billed output tokens and 3% of billed fresh input, because Claude Code bills internal

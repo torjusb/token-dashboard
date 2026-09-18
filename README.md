@@ -49,6 +49,30 @@ carry `attributionMcpServer` and `attributionMcpTool` fields, which look like th
 source and are not: they disagree with the tool actually invoked on their own line, so
 nothing here reads them. `SPEC.md` has the measurements.
 
+## How long a session runs, and how long it runs alone
+
+The transcripts record every request Claude Code made and every tool it called, but nothing in
+them says when *you* typed. So the dashboard reads that separately, off the `type:"user"` lines
+that survive a filter: no tool results, no subagent prompts, no injected context, and no
+messages from another Claude session. What is left is a person acting. Over 30 days that is
+791 turns. Four of the 285 sessions in the window have none of them, and the largest of those
+four is seven requests: work another session started.
+
+With those boundaries the Sessions panel can show two things the request stream alone cannot.
+Session length, where the median leads because the mean is 4h against a median of 10 minutes:
+sessions left open overnight drag the average, and the median is the one that describes a
+working day. And the longest run without human input, meaning the longest stretch of requests
+with no turn of yours inside it.
+
+A run also ends after 30 minutes of silence. Without that cut the longest "unattended run" is
+three and a half days, almost all of it one idle gap around four requests, which measures a
+laptop left open rather than an agent working. Of 31,428 gaps between consecutive requests in a
+window, only 79 run past 30 minutes, so the cut lands in the tail rather than through the
+middle of anything. The answer does move with it, from 3.2h at a 5-minute cut to 7.8h at half
+an hour, which is why the tile shows the run's request count next to its duration.
+`npm run validate` asserts that under 1% of gaps run past the cut, so the number cannot rot
+quietly as habits change.
+
 ## Cost is a lower bound
 
 Token counts here are essentially complete: the transcripts hold 98% of the cache reads and
@@ -70,12 +94,13 @@ more than 10% off Claude Code's own total.
 npm run validate
 ```
 
-`scripts/validate.ts` re-counts distinct requests and distinct tool calls with its own
-independent reader, compares derived cost against the `totalCostUSD` Claude Code records for
+`scripts/validate.ts` re-counts distinct requests, distinct tool calls and human turns with its
+own independent reader, compares derived cost against the `totalCostUSD` Claude Code records for
 each session, re-runs the backfill to prove ingest is idempotent, asserts the per-event
-invariants, and proves no request carries two different skill attributions, since the
-per-skill cost figures rest on that. It exits non-zero on failure, so it is the thing to run
-after any change to the ingest path rather than trusting the dashboard to look plausible.
+invariants, proves no request carries two different skill attributions, since the per-skill cost
+figures rest on that, and checks that the 30-minute idle cut still sits in the tail of the gap
+distribution. It exits non-zero on failure, so it is the thing to run after any change to the
+ingest path rather than trusting the dashboard to look plausible.
 
 ## Layout
 
